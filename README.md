@@ -83,3 +83,39 @@ curl http://localhost:8081/livez
 curl http://localhost:8082/healthz
 curl http://localhost:8082/livez
 ```
+
+---
+
+## 📨 Ingestion API (`POST /v1/messages`)
+
+Recebe mensagens de webhooks externos com processamento assíncrono (**`202 Accepted`**), protegida contra payloads abusivos (>1MB) e com injeção automática de `X-Request-ID`.
+
+### Exemplo de Ingestão:
+
+```bash
+curl -i -X POST http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "tenant-123",
+    "conversation_id": "conv-456",
+    "external_message_id": "wpp-789",
+    "channel": "whatsapp",
+    "role": "user",
+    "content": "Olá, preciso de ajuda!"
+  }'
+```
+
+**Resposta:**
+```http
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+X-Request-Id: 44f2d34a413d9ea0c43666b3d4111fa6
+
+{
+  "status": "accepted",
+  "message_id": "fa2c4bb41e97deff8beceee4d4f8ff93",
+  "conversation_id": "conv-456",
+  "accepted_at": "2026-10-27T23:42:00Z"
+}
+```
+

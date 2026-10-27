@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/config"
+	transporthttp "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/http"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/http/handler"
 )
 
 func main() {
@@ -21,6 +23,8 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+
+	// Endpoints operacionais / diagnóstico
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -33,9 +37,20 @@ func main() {
 		_, _ = w.Write([]byte(`{"status":"alive","service":"api"}`))
 	})
 
+	// Ingestion API (POST /v1/messages)
+	// No momento o service é nil (retornará 202 Accepted gerando os IDs);
+	// nas próximas etapas conectaremos a implementação concreta de persistência/eventos.
+	msgHandler := handler.NewMessageHandler(nil)
+	mux.HandleFunc("/v1/messages", msgHandler.HandleIngest)
+
+	// Middlewares globais: Request ID tracing e Structured Logging
+	handlerWithMiddlewares := transporthttp.RequestIDMiddleware(
+		transporthttp.LoggingMiddleware(mux),
+	)
+
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           mux,
+		Handler:           handlerWithMiddlewares,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
