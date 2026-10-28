@@ -15,7 +15,6 @@ import (
 )
 
 func main() {
-	// Worker default port: 8081 (overrideable with PORT env)
 	cfg, err := config.Load(8081)
 	if err != nil {
 		log.Fatalf("failed to load configuration: %v", err)

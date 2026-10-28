@@ -8,8 +8,6 @@ import (
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/domain"
 )
 
-// --- TESTES DE CONVERSATION ---
-
 func TestConversation_Validation(t *testing.T) {
 	validConv := domain.Conversation{
 		ID:                     "conv-123",
@@ -100,8 +98,6 @@ func TestConversation_JSONSerialization(t *testing.T) {
 	}
 }
 
-// --- TESTES DE MESSAGE ---
-
 func TestMessage_Validation(t *testing.T) {
 	validMsg := domain.Message{
 		ID:                "msg-1",
@@ -167,8 +163,6 @@ func TestMessage_Validation(t *testing.T) {
 		}
 	})
 }
-
-// --- TESTES DE EVENTOS (GENERICS) ---
 
 func TestEventEnvelope_JSON(t *testing.T) {
 	now := time.Now().Truncate(time.Millisecond).UTC()

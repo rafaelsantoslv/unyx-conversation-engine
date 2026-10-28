@@ -30,6 +30,7 @@ type Conversation struct {
 	ExternalConversationID string                 `json:"external_conversation_id"`
 	Channel                string                 `json:"channel"`
 	State                  ConversationState      `json:"state"`
+	Version                int64                  `json:"version"`
 	Metadata               map[string]interface{} `json:"metadata,omitempty"`
 	CreatedAt              time.Time              `json:"created_at"`
 	UpdatedAt              time.Time              `json:"updated_at"`

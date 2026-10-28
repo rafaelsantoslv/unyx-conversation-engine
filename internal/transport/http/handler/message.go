@@ -13,7 +13,7 @@ import (
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/http/dto"
 )
 
-const maxPayloadBytes = 1024 * 1024 // 1 MB
+const maxPayloadBytes = 1024 * 1024
 
 type IngestionService interface {
 	IngestMessage(ctx context.Context, req dto.IngestMessageRequest, messageID string) error
@@ -30,16 +30,13 @@ func NewMessageHandler(service IngestionService) *MessageHandler {
 func (h *MessageHandler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	reqID := transporthttp.RequestIDFromContext(r.Context())
 
-	// 1. Apenas POST permitido
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "", reqID)
 		return
 	}
 
-	// 2. Proteção contra payloads gigantes (MaxBytesReader)
 	r.Body = http.MaxBytesReader(w, r.Body, maxPayloadBytes)
 
-	// 3. Desserialização estrita
 	var req dto.IngestMessageRequest
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -54,13 +51,11 @@ func (h *MessageHandler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Fail-fast de validação dos campos
 	if err := req.Validate(); err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, "validation failed", err.Error(), reqID)
 		return
 	}
 
-	// 5. Geração do message_id e delegação assíncrona
 	messageID := generateID()
 	if h.service != nil {
 		if err := h.service.IngestMessage(r.Context(), req, messageID); err != nil {
@@ -69,7 +64,6 @@ func (h *MessageHandler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 6. Resposta 202 Accepted imediata
 	resp := dto.IngestMessageResponse{
 		Status:         "accepted",
 		MessageID:      messageID,

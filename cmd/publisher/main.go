@@ -15,7 +15,6 @@ import (
 )
 
 func main() {
-	// Publisher default port: 8082 (overrideable with PORT env)
 	cfg, err := config.Load(8082)
 	if err != nil {
 		log.Fatalf("failed to load configuration: %v", err)

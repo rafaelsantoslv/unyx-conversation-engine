@@ -6,19 +6,14 @@ import (
 	"strings"
 )
 
-// Config holds typed configuration loaded from environment variables.
+// Config armazena configuracoes tipadas carregadas de variaveis de ambiente.
 type Config struct {
 	Port         int
 	DatabaseURL  string
 	KafkaBrokers []string
 }
 
-// Load reads configuration from environment variables with sensible defaults.
-//
-// Recognized environment variables:
-// - PORT: port number for HTTP server (default: 8080 or fallback parameter)
-// - DATABASE_URL: PostgreSQL connection string (default: postgres://postgres:postgres@localhost:5432/unyx_conversation?sslmode=disable)
-// - KAFKA_BROKERS: Comma-separated list of Kafka broker addresses (default: localhost:9092)
+// Load carrega as configuracoes das variaveis de ambiente com valores padrao.
 func Load(defaultPort ...int) (*Config, error) {
 	fallbackPort := 8080
 	if len(defaultPort) > 0 && defaultPort[0] > 0 {

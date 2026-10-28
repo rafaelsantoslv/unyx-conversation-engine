@@ -47,7 +47,6 @@ func TestMessageHandler_HandleIngest(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 
-		// Executa com os middlewares de RequestID e Logging
 		transporthttp.RequestIDMiddleware(http.HandlerFunc(h.HandleIngest)).ServeHTTP(w, req)
 
 		if w.Code != http.StatusAccepted {
