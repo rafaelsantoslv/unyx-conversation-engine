@@ -213,3 +213,45 @@ func TestEventEnvelope_JSON(t *testing.T) {
 		t.Errorf("expected event type preserved, got %s", deserialized.EventType)
 	}
 }
+
+func TestOutboxEvent_Validation(t *testing.T) {
+	validEvt := domain.OutboxEvent{
+		ID:             "outbox-1",
+		TenantID:       "tenant-1",
+		ConversationID: "conv-1",
+		EventType:      domain.EventTypeMessageReceived,
+		Payload:        json.RawMessage(`{"content":"teste"}`),
+		PartitionKey:   "conv-1",
+		Status:         domain.OutboxStatusPending,
+	}
+
+	t.Run("valid outbox event", func(t *testing.T) {
+		if err := validEvt.Validate(); err != nil {
+			t.Fatalf("expected valid outbox event, got %v", err)
+		}
+	})
+
+	t.Run("empty partition key", func(t *testing.T) {
+		o := validEvt
+		o.PartitionKey = "   "
+		if err := o.Validate(); err != domain.ErrEmptyOutboxPartitionKey {
+			t.Fatalf("expected ErrEmptyOutboxPartitionKey, got %v", err)
+		}
+	})
+
+	t.Run("empty payload", func(t *testing.T) {
+		o := validEvt
+		o.Payload = nil
+		if err := o.Validate(); err != domain.ErrEmptyOutboxPayload {
+			t.Fatalf("expected ErrEmptyOutboxPayload, got %v", err)
+		}
+	})
+
+	t.Run("invalid status", func(t *testing.T) {
+		o := validEvt
+		o.Status = "INVALID_STATUS"
+		if err := o.Validate(); err != domain.ErrInvalidOutboxStatus {
+			t.Fatalf("expected ErrInvalidOutboxStatus, got %v", err)
+		}
+	})
+}

@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/domain"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/storage/postgres"
@@ -198,6 +200,132 @@ func TestRepository_SaveMessage_And_Deduplication(t *testing.T) {
 		}
 		if existing.Content != "Primeira mensagem" {
 			t.Errorf("expected original content preserved, got %s", existing.Content)
+		}
+	})
+}
+
+func TestRepository_TransactionalOutbox(t *testing.T) {
+	pool := setupTestDB(t)
+	defer pool.Close()
+
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+
+	tenantID := fmt.Sprintf("tenant-outbox-%d", time.Now().UnixNano())
+	conv, err := repo.GetOrCreateConversation(ctx, tenantID, "conv-ext-outbox-1")
+	if err != nil {
+		t.Fatalf("failed to prepare conversation: %v", err)
+	}
+
+	t.Run("commits message and outbox event atomically", func(t *testing.T) {
+		msg := &domain.Message{
+			TenantID:          tenantID,
+			ConversationID:    conv.ID,
+			ExternalMessageID: "msg-atomic-1",
+			Role:              domain.RoleUser,
+			Content:           "Mensagem atomica com outbox",
+		}
+
+		payloadBytes, _ := json.Marshal(map[string]string{"message": msg.Content})
+		evt := &domain.OutboxEvent{
+			EventType:    domain.EventTypeMessageReceived,
+			Payload:      payloadBytes,
+			PartitionKey: conv.ID,
+			Status:       domain.OutboxStatusPending,
+		}
+
+		savedMsg, err := repo.SaveMessageWithOutbox(ctx, msg, evt)
+		if err != nil {
+			t.Fatalf("failed to save message with outbox: %v", err)
+		}
+
+		if savedMsg.ID == "" || evt.ID == "" {
+			t.Errorf("expected non-empty IDs for msg and outbox event")
+		}
+
+		// Valida busca com FOR UPDATE SKIP LOCKED
+		events, err := repo.FetchPendingOutboxEvents(ctx, 10)
+		if err != nil {
+			t.Fatalf("failed to fetch pending outbox events: %v", err)
+		}
+
+		var found bool
+		for _, e := range events {
+			if e.ID == evt.ID {
+				found = true
+				if e.Status != domain.OutboxStatusPending {
+					t.Errorf("expected status PENDING, got %s", e.Status)
+				}
+				if e.PartitionKey != conv.ID {
+					t.Errorf("expected partition key %s, got %s", conv.ID, e.PartitionKey)
+				}
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("expected outbox event %s to be in pending list", evt.ID)
+		}
+
+		// Marca como publicado e valida que não vem mais como pendente
+		if err := repo.MarkOutboxEventPublished(ctx, evt.ID); err != nil {
+			t.Fatalf("failed to mark outbox event published: %v", err)
+		}
+
+		pendingAfter, err := repo.FetchPendingOutboxEvents(ctx, 10)
+		if err != nil {
+			t.Fatalf("failed to fetch pending after publish: %v", err)
+		}
+		for _, e := range pendingAfter {
+			if e.ID == evt.ID {
+				t.Errorf("outbox event %s should not appear as pending after being marked published", evt.ID)
+			}
+		}
+	})
+
+	t.Run("rollbacks both message and outbox event on failure", func(t *testing.T) {
+		msg := &domain.Message{
+			TenantID:          tenantID,
+			ConversationID:    conv.ID,
+			ExternalMessageID: "msg-rollback-test",
+			Role:              domain.RoleUser,
+			Content:           "Mensagem de teste de rollback",
+		}
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("failed to start manual transaction: %v", err)
+		}
+		defer func() {
+			_ = tx.Rollback(ctx)
+		}()
+
+		if err := repo.InsertMessage(ctx, tx, msg); err != nil {
+			t.Fatalf("failed to insert message in tx: %v", err)
+		}
+
+		// Força erro de banco no outbox (ID duplicado ou violação proposital)
+		invalidEvt := &domain.OutboxEvent{
+			ID:             "invalid-not-uuid", // falhará em UUID no postgres se for formato inválido
+			TenantID:       tenantID,
+			ConversationID: conv.ID,
+			EventType:      domain.EventTypeMessageReceived,
+			Payload:        []byte(`{}`),
+			PartitionKey:   conv.ID,
+		}
+
+		err = repo.InsertOutboxEvent(ctx, tx, invalidEvt)
+		if err == nil {
+			t.Fatalf("expected error inserting outbox with invalid UUID")
+		}
+
+		// Desfaz transação
+		_ = tx.Rollback(ctx)
+
+		// Verifica que a mensagem NÃO foi gravada no banco
+		_, checkErr := repo.GetMessageByExternalID(ctx, tenantID, msg.ExternalMessageID)
+		if !errors.Is(checkErr, pgx.ErrNoRows) {
+			t.Fatalf("expected pgx.ErrNoRows for message after rollback, got %v", checkErr)
 		}
 	})
 }
