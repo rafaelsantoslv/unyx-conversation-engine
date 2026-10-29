@@ -36,6 +36,13 @@ type ResultsRepository interface {
 	QuarantineEvent(ctx context.Context, qEvent domain.QuarantinedEvent) error
 }
 
+// DebounceRepository define as operações duráveis de debounce no pipeline.
+type DebounceRepository interface {
+	RegisterOrExtendWindow(ctx context.Context, tenantID, conversationID string, cfg domain.DebounceConfig) (*domain.DebounceWindow, error)
+	GetActiveWindow(ctx context.Context, conversationID string) (*domain.DebounceWindow, error)
+	MarkWindowProcessed(ctx context.Context, conversationID string) error
+}
+
 // ConversationCoordinator define o contrato para coordenação distribuída entre múltiplos workers (INV-02, INV-04, INV-08).
 type ConversationCoordinator interface {
 	AcquireExecution(ctx context.Context, tenantID, conversationID, workerID string, leaseDuration time.Duration) (*domain.ConversationExecution, error)
@@ -50,6 +57,8 @@ type DefaultMessagePipelineHandler struct {
 	runtime           domain.AgentRuntime
 	resultsRepo       ResultsRepository
 	coordinator       ConversationCoordinator
+	debounceRepo      DebounceRepository
+	debounceCfg       domain.DebounceConfig
 	workerID          string
 	leaseTime         time.Duration
 	heartbeatInterval time.Duration
@@ -67,6 +76,7 @@ func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime, resultsRepo R
 		heartbeatInterval: 10 * time.Second,
 		baseBackoff:       500 * time.Millisecond,
 		maxBackoff:        30 * time.Second,
+		debounceCfg:       domain.DebounceConfig{InactivityWindow: 0, MaxWaitTimeout: 0}, // Padrão desabilitado para retrocompatibilidade
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -76,6 +86,13 @@ func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime, resultsRepo R
 
 // PipelineOption configura o DefaultMessagePipelineHandler.
 type PipelineOption func(*DefaultMessagePipelineHandler)
+
+func WithDebounce(repo DebounceRepository, cfg domain.DebounceConfig) PipelineOption {
+	return func(h *DefaultMessagePipelineHandler) {
+		h.debounceRepo = repo
+		h.debounceCfg = cfg
+	}
+}
 
 func WithRetrySettings(baseBackoff, maxBackoff time.Duration) PipelineOption {
 	return func(h *DefaultMessagePipelineHandler) {
@@ -173,7 +190,41 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		}
 	}
 
-	// 3. Coordenação Distribuída Atômica de Conversa (INV-02, INV-04, INV-08)
+	// 3. Gestão Durável de Debounce / Sliding Inactivity Window (INV-01, INV-02, INV-10)
+	if h.debounceRepo != nil && h.debounceCfg.InactivityWindow > 0 {
+		window, err := h.debounceRepo.RegisterOrExtendWindow(ctx, tenantID, convID, h.debounceCfg)
+		if err != nil {
+			log.Printf("[pipeline] warning: failed to register/extend debounce window: %v", err)
+		} else if window != nil {
+			now := time.Now().UTC()
+			if !window.IsReady(now) {
+				// Aguarda a janela de inatividade fechar ou teto máximo ser atingido (Sliding Window)
+				waitDuration := time.Until(window.DebounceUntil)
+				if waitDuration > 0 {
+					log.Printf("[pipeline] debounce: message %s waiting %v for silence window (msg_count=%d)",
+						msgID, waitDuration, window.MessageCount)
+					select {
+					case <-time.After(waitDuration):
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+
+				// Revalida se uma nova mensagem estendeu a janela enquanto esperávamos
+				activeWin, checkErr := h.debounceRepo.GetActiveWindow(ctx, convID)
+				if checkErr == nil && activeWin != nil && activeWin.Status == domain.DebounceStatusOpen && !activeWin.IsReady(time.Now().UTC()) {
+					log.Printf("[pipeline] debounce: window was extended by another incoming message (msg_count=%d). Deferring execution.",
+						activeWin.MessageCount)
+					return nil
+				}
+			}
+
+			// Marca janela como processada para o lote atual
+			_ = h.debounceRepo.MarkWindowProcessed(ctx, convID)
+		}
+	}
+
+	// 4. Coordenação Distribuída Atômica de Conversa (INV-02, INV-04, INV-08)
 	var activeExec *domain.ConversationExecution
 	if h.coordinator != nil {
 		exec, err := h.coordinator.AcquireExecution(ctx, tenantID, convID, h.workerID, h.leaseTime)

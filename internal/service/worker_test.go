@@ -645,6 +645,109 @@ func TestDefaultMessagePipelineHandler_OrderingAndIdempotency(t *testing.T) {
 			t.Errorf("expected tenant_id tenant-perm in quarantine, got %s", q.TenantID)
 		}
 	})
+
+	t.Run("debounces rapid burst of messages and defers execution (INV-02, INV-10)", func(t *testing.T) {
+		resultsRepo := newMockResultsRepo()
+		debounceRepo := newMockDebounceRepo()
+		runtime := &mockAgentRuntime{}
+
+		cfg := domain.DebounceConfig{
+			InactivityWindow: 30 * time.Millisecond,
+			MaxWaitTimeout:   100 * time.Millisecond,
+		}
+
+		pipeline := service.NewDefaultMessagePipelineHandler(
+			runtime,
+			resultsRepo,
+			service.WithDebounce(debounceRepo, cfg),
+		)
+
+		evt1 := domain.Event[domain.MessageReceivedPayload]{
+			EventID:        "evt-deb-1",
+			TenantID:       "tenant-deb",
+			ConversationID: "conv-deb",
+			EventType:      domain.EventTypeMessageReceived,
+			Payload: domain.MessageReceivedPayload{
+				MessageID:      "msg-deb-1",
+				SequenceNumber: 1,
+				Content:        "Quero agendar",
+				Role:           domain.RoleUser,
+			},
+		}
+
+		// Dispara mensagem 1
+		err := pipeline.HandleMessageReceived(ctx, evt1)
+		if err != nil {
+			t.Fatalf("first message failed: %v", err)
+		}
+
+		if debounceRepo.extendCalls < 1 {
+			t.Errorf("expected extendCalls >= 1, got %d", debounceRepo.extendCalls)
+		}
+		if debounceRepo.processCalls != 1 {
+			t.Errorf("expected processCalls == 1, got %d", debounceRepo.processCalls)
+		}
+	})
+}
+
+type mockDebounceRepo struct {
+	mu           sync.Mutex
+	windows      map[string]*domain.DebounceWindow
+	extendCalls  int
+	processCalls int
+}
+
+func newMockDebounceRepo() *mockDebounceRepo {
+	return &mockDebounceRepo{
+		windows: make(map[string]*domain.DebounceWindow),
+	}
+}
+
+func (m *mockDebounceRepo) RegisterOrExtendWindow(ctx context.Context, tenantID, conversationID string, cfg domain.DebounceConfig) (*domain.DebounceWindow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.extendCalls++
+	now := time.Now().UTC()
+	win, ok := m.windows[conversationID]
+	if !ok || win.Status == domain.DebounceStatusProcessed {
+		win = &domain.DebounceWindow{
+			ID:              "win-1",
+			TenantID:        tenantID,
+			ConversationID:  conversationID,
+			WindowStartedAt: now,
+			DebounceUntil:   now.Add(cfg.InactivityWindow),
+			MaxWaitUntil:    now.Add(cfg.MaxWaitTimeout),
+			MessageCount:    1,
+			Status:          domain.DebounceStatusOpen,
+		}
+		m.windows[conversationID] = win
+		return win, nil
+	}
+
+	win.MessageCount++
+	newDebounce := now.Add(cfg.InactivityWindow)
+	if newDebounce.After(win.MaxWaitUntil) {
+		win.DebounceUntil = win.MaxWaitUntil
+	} else {
+		win.DebounceUntil = newDebounce
+	}
+	return win, nil
+}
+
+func (m *mockDebounceRepo) GetActiveWindow(ctx context.Context, conversationID string) (*domain.DebounceWindow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.windows[conversationID], nil
+}
+
+func (m *mockDebounceRepo) MarkWindowProcessed(ctx context.Context, conversationID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.processCalls++
+	if win, ok := m.windows[conversationID]; ok {
+		win.Status = domain.DebounceStatusProcessed
+	}
+	return nil
 }
 
 type mockCoordinatorTest struct {
