@@ -15,6 +15,7 @@ import (
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/config"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/runtime/mock"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/service"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/storage/postgres"
 	transkafka "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/kafka"
 )
 
@@ -27,12 +28,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 1. Conexão opcional com PostgreSQL (para healthcheck e liveness da stack)
+	// 1. Conexão com PostgreSQL
 	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("failed to create postgres connection pool: %v", err)
 	}
 	defer dbPool.Close()
+
+	if err := postgres.RunMigrations(ctx, dbPool, "migrations"); err != nil {
+		log.Printf("warning: migrations execution failed: %v", err)
+	}
+
+	resultsRepo := postgres.NewResultsRepository(dbPool)
 
 	// 2. Inicializa Kafka Consumer com Consumer Group "conversation-engine-workers"
 	consumerCfg := transkafka.ConsumerConfig{
@@ -51,12 +58,12 @@ func main() {
 		}
 	}()
 
-	// 3. Inicializa MockRuntime e Worker Service com handler de pipeline
+	// 3. Inicializa MockRuntime e Worker Service com handler de pipeline integrado ao PostgreSQL
 	mockRuntime := mock.NewMockRuntime(
 		mock.WithLatency(150 * time.Millisecond), // Simula tempo de raciocínio da IA
 		mock.WithSimulatedReply("Olá! Sou o assistente virtual Unyx. Como posso ajudar você hoje?"),
 	)
-	pipelineHandler := service.NewDefaultMessagePipelineHandler(mockRuntime)
+	pipelineHandler := service.NewDefaultMessagePipelineHandler(mockRuntime, resultsRepo)
 	workerService := service.NewConversationWorkerService(kafkaConsumer, pipelineHandler)
 
 	// 4. Servidor HTTP de Health Check e Liveness

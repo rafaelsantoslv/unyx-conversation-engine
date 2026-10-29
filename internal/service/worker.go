@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/domain"
 	transkafka "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/kafka"
@@ -17,25 +18,65 @@ type MessagePipelineHandler interface {
 	HandleMessageReceived(ctx context.Context, evt domain.Event[domain.MessageReceivedPayload]) error
 }
 
-// DefaultMessagePipelineHandler é uma implementação padrão para o worker encaminhar a mensagem para o AgentRuntime.
-type DefaultMessagePipelineHandler struct {
-	runtime domain.AgentRuntime
+// ResultsRepository define a interface necessária para registrar o ciclo de vida da execução.
+type ResultsRepository interface {
+	GetResult(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error)
+	RecordExecutionStart(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error)
+	RecordExecutionSuccess(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, executionTime time.Duration) error
+	RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration) error
 }
 
-// NewDefaultMessagePipelineHandler cria um novo handler integrando o AgentRuntime.
-func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime) *DefaultMessagePipelineHandler {
-	return &DefaultMessagePipelineHandler{runtime: runtime}
+// DefaultMessagePipelineHandler é a implementação do pipeline que orquestra idempotência, AgentRuntime e persistência durável no PostgreSQL.
+type DefaultMessagePipelineHandler struct {
+	runtime     domain.AgentRuntime
+	resultsRepo ResultsRepository
+}
+
+// NewDefaultMessagePipelineHandler cria um novo handler integrando o AgentRuntime e ResultsRepository.
+func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime, resultsRepo ResultsRepository) *DefaultMessagePipelineHandler {
+	return &DefaultMessagePipelineHandler{
+		runtime:     runtime,
+		resultsRepo: resultsRepo,
+	}
 }
 
 func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Context, evt domain.Event[domain.MessageReceivedPayload]) error {
-	log.Printf("[pipeline] message event received: event_id=%s, tenant=%s, conv=%s, role=%s, content_len=%d",
-		evt.EventID, evt.TenantID, evt.ConversationID, evt.Payload.Role, len(evt.Payload.Content))
+	log.Printf("[pipeline] message event received: event_id=%s, tenant=%s, conv=%s, msg_id=%s, role=%s",
+		evt.EventID, evt.TenantID, evt.ConversationID, evt.Payload.MessageID, evt.Payload.Role)
 
+	tenantID := evt.TenantID
+	convID := evt.ConversationID
+	msgID := evt.Payload.MessageID
+
+	// 1. Verificação prévia de idempotência: se o evento já foi processado com sucesso, ignorar reexecução
+	if h.resultsRepo != nil {
+		existing, err := h.resultsRepo.GetResult(ctx, tenantID, convID, msgID)
+		if err != nil {
+			log.Printf("[pipeline] warning: failed to check existing processing result: %v", err)
+			return fmt.Errorf("failed to check existing result: %w", err)
+		}
+
+		if existing != nil && existing.Status == domain.ExecutionStatusSucceeded {
+			log.Printf("[pipeline] idempotency: message %s (conv=%s) already processed with status SUCCEEDED. Skipping execution.",
+				msgID, convID)
+			return nil
+		}
+
+		// 2. Registra início da execução como RUNNING
+		if _, err := h.resultsRepo.RecordExecutionStart(ctx, tenantID, convID, msgID); err != nil {
+			log.Printf("[pipeline] error recording execution start: %v", err)
+			return fmt.Errorf("failed to record execution start: %w", err)
+		}
+	}
+
+	start := time.Now()
+
+	// 3. Execução do Runtime (IA / Mock)
 	if h.runtime != nil {
 		execInput := domain.ExecutionInput{
-			TenantID:       evt.TenantID,
-			ConversationID: evt.ConversationID,
-			MessageID:      evt.Payload.MessageID,
+			TenantID:       tenantID,
+			ConversationID: convID,
+			MessageID:      msgID,
 			Content:        evt.Payload.Content,
 			Metadata: map[string]string{
 				"channel":  evt.Payload.Channel,
@@ -45,12 +86,28 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		}
 
 		out, err := h.runtime.Execute(ctx, execInput)
+		execDuration := time.Since(start)
+
 		if err != nil {
+			log.Printf("[pipeline] agent runtime failed for message %s: %v", msgID, err)
+			if h.resultsRepo != nil {
+				if recErr := h.resultsRepo.RecordExecutionFailure(ctx, tenantID, convID, msgID, err, execDuration); recErr != nil {
+					log.Printf("[pipeline] warning: failed to record execution failure in db: %v", recErr)
+				}
+			}
 			return fmt.Errorf("agent runtime execution error: %w", err)
 		}
 
 		log.Printf("[pipeline] agent runtime responded successfully: tokens=%d, reply_preview=%.40s...",
 			out.TokensUsed, out.ResponseContent)
+
+		// 4. Salva resultado de sucesso de forma durável no PostgreSQL
+		if h.resultsRepo != nil {
+			if err := h.resultsRepo.RecordExecutionSuccess(ctx, tenantID, convID, msgID, out, execDuration); err != nil {
+				log.Printf("[pipeline] error saving execution success to db: %v", err)
+				return fmt.Errorf("failed to record execution success in database: %w", err)
+			}
+		}
 	}
 
 	return nil
@@ -107,7 +164,6 @@ func (w *ConversationWorkerService) handleMessage(ctx context.Context, msg kafka
 		log.Printf("ERROR: invalid event schema (event_id=%s, key=%s, offset=%d): %v",
 			evt.EventID, string(msg.Key), msg.Offset, err)
 
-		// Mensagem com schema inválido também é commitada para não bloquear a partição
 		if commitErr := w.consumer.CommitMessages(ctx, msg); commitErr != nil {
 			log.Printf("failed to commit invalid schema message: %v", commitErr)
 			return commitErr
@@ -126,15 +182,15 @@ func (w *ConversationWorkerService) handleMessage(ctx context.Context, msg kafka
 		return nil
 	}
 
-	// Encaminha para o pipeline de execução da conversa
+	// Encaminha para o pipeline de execução da conversa (que salva resultado no PostgreSQL)
 	if err := w.handler.HandleMessageReceived(ctx, evt); err != nil {
 		log.Printf("ERROR: pipeline execution failed for event %s: %v", evt.EventID, err)
-		// NÃO commitar offset em caso de falha de execução de negócio transitória,
+		// NÃO commitar offset em caso de falha de execução de negócio ou de banco,
 		// permitindo reprocessamento at-least-once pelo grupo.
 		return fmt.Errorf("pipeline processing error: %w", err)
 	}
 
-	// Efetua commit manual do offset após processamento com sucesso
+	// Efetua commit manual do offset APÓS sucesso na persistência do resultado no PostgreSQL
 	if err := w.consumer.CommitMessages(ctx, msg); err != nil {
 		log.Printf("ERROR: failed to commit offset for event %s (offset=%d): %v",
 			evt.EventID, msg.Offset, err)

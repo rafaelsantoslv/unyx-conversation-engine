@@ -10,8 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/domain"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/runtime/mock"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/service"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/storage/postgres"
 	transkafka "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/kafka"
 	"github.com/segmentio/kafka-go"
 )
@@ -176,5 +180,134 @@ CheckResults:
 			t.Errorf("sequence number mismatch at index %d: expected %d, got %d",
 				i, expectedSeq, received[i].Payload.SequenceNumber)
 		}
+	}
+}
+
+
+func TestConversationWorker_WithPostgresResults_Integration(t *testing.T) {
+	brokersEnv := os.Getenv("KAFKA_BROKERS")
+	if brokersEnv == "" {
+		brokersEnv = "localhost:9092"
+	}
+	brokers := strings.Split(brokersEnv, ",")
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://postgres:postgres@localhost:5432/unyx_conversation?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 1. Conecta ao banco de dados PostgreSQL
+	dbPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Skipf("skipping integration test: postgres connection failed: %v", err)
+		return
+	}
+	defer dbPool.Close()
+
+	if err := dbPool.Ping(ctx); err != nil {
+		t.Skipf("skipping integration test: postgres ping failed: %v", err)
+		return
+	}
+
+	repo := postgres.NewRepository(dbPool)
+	resultsRepo := postgres.NewResultsRepository(dbPool)
+
+	// Cria conversa no banco
+	tenantID := fmt.Sprintf("tenant-e2e-%d", time.Now().UnixNano())
+	extConvID := fmt.Sprintf("conv-e2e-%d", time.Now().UnixNano())
+	conv, err := repo.GetOrCreateConversation(ctx, tenantID, extConvID)
+	if err != nil {
+		t.Fatalf("failed to create conversation: %v", err)
+	}
+
+	// 2. Cria tópico de teste no Kafka
+	topic := fmt.Sprintf("test.results.worker.%d", time.Now().UnixNano())
+	conn, err := kafka.Dial("tcp", brokers[0])
+	if err != nil {
+		t.Skipf("skipping test: kafka dial failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	_ = conn.CreateTopics(kafka.TopicConfig{
+		Topic:             topic,
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	})
+
+	publisher := transkafka.NewKafkaPublisher(brokers)
+	defer publisher.Close()
+
+	// 3. Publica mensagem no Kafka
+	msgID := uuid.New().String()
+	evtID := fmt.Sprintf("evt-e2e-%d", time.Now().UnixNano())
+	evt := domain.Event[domain.MessageReceivedPayload]{
+		EventID:        evtID,
+		TenantID:       tenantID,
+		ConversationID: conv.ID,
+		EventType:      domain.EventTypeMessageReceived,
+		Version:        domain.EventVersionV1,
+		OccurredAt:     time.Now().UTC(),
+		Payload: domain.MessageReceivedPayload{
+			MessageID:         msgID,
+			ExternalMessageID: fmt.Sprintf("ext-e2e-%d", time.Now().UnixNano()),
+			Channel:           "whatsapp",
+			Role:              domain.RoleUser,
+			Content:           "Pergunta de teste para persistir resultado",
+			SequenceNumber:    1,
+		},
+	}
+	payloadBytes, _ := json.Marshal(evt)
+	err = publisher.Publish(ctx, topic, tenantID+":"+conv.ID, payloadBytes)
+	if err != nil {
+		t.Fatalf("failed to publish to kafka: %v", err)
+	}
+
+	// 4. Inicializa o Worker com DefaultMessagePipelineHandler conectado ao Postgres
+	mockRuntime := mock.NewMockRuntime(
+		mock.WithLatency(10*time.Millisecond),
+		mock.WithSimulatedReply("Resposta persistida no Postgres com sucesso!"),
+	)
+	pipeline := service.NewDefaultMessagePipelineHandler(mockRuntime, resultsRepo)
+
+	consumer := transkafka.NewKafkaConsumer(transkafka.ConsumerConfig{
+		Brokers: brokers,
+		Topic:   topic,
+		GroupID: fmt.Sprintf("group-results-%d", time.Now().UnixNano()),
+		MaxWait: 200 * time.Millisecond,
+	})
+	defer consumer.Close()
+
+	worker := service.NewConversationWorkerService(consumer, pipeline)
+
+	// 5. Executa uma iteração de consumo
+	err = worker.ProcessNextMessage(ctx)
+	if err != nil {
+		t.Fatalf("worker failed to process message: %v", err)
+	}
+
+	// 6. Verifica no PostgreSQL se o registro foi salvo com status SUCCEEDED
+	savedRes, err := resultsRepo.GetResult(ctx, tenantID, conv.ID, msgID)
+	if err != nil {
+		t.Fatalf("failed to query processing result: %v", err)
+	}
+	if savedRes == nil {
+		t.Fatalf("processing result was NOT saved in postgres!")
+	}
+	if savedRes.Status != domain.ExecutionStatusSucceeded {
+		t.Errorf("expected status SUCCEEDED, got %s", savedRes.Status)
+	}
+	if savedRes.CompletedAt == nil {
+		t.Errorf("expected completed_at to be populated")
+	}
+
+	// 7. Teste de Idempotência: processa o mesmo evento novamente
+	// O pipeline deve detectar que já está SUCCEEDED e não deve reexecutar o runtime
+	err = pipeline.HandleMessageReceived(ctx, evt)
+	if err != nil {
+		t.Fatalf("repeated execution failed: %v", err)
 	}
 }
