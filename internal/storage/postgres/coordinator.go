@@ -167,6 +167,87 @@ func (c *ExecutionCoordinator) ReleaseExecutionWithFencing(ctx context.Context, 
 	return nil
 }
 
+// ReleaseExecutionAndSchedulePending libera a concessão da conversa e, na mesma transação atômica,
+// verifica se chegaram mensagens in-flight com sequence_number > watermarkSequence.
+// Se houver mensagens pendentes, agenda imediatamente a próxima execução durável no PostgreSQL (INV-01, INV-02, INV-10).
+func (c *ExecutionCoordinator) ReleaseExecutionAndSchedulePending(
+	ctx context.Context,
+	executionID string,
+	fencingToken int64,
+	tenantID, conversationID string,
+	watermarkSequence int64,
+	finalStatus domain.ExecutionStatus,
+) (*domain.HasPendingMessagesResult, error) {
+	now := time.Now().UTC()
+
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	// 1. Libera a execução ativa validando o fencing_token
+	releaseQuery := `
+	UPDATE conversation_executions
+	SET status = $1, released_at = $2, updated_at = $2
+	WHERE id = $3 AND fencing_token = $4;
+	`
+	cmdTag, err := tx.Exec(ctx, releaseQuery, string(finalStatus), now, executionID, fencingToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to release conversation execution: %w", err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		return nil, domain.ErrFencingTokenStale
+	}
+
+	// 2. Verifica se há mensagens in-flight (com sequence_number > watermarkSequence)
+	checkQuery := `
+	SELECT COUNT(*), COALESCE(MAX(sequence_number), 0)
+	FROM messages
+	WHERE tenant_id = $1 AND conversation_id = $2 AND sequence_number > $3;
+	`
+	var pendingCount int
+	var maxSeq int64
+	if err := tx.QueryRow(ctx, checkQuery, tenantID, conversationID, watermarkSequence).Scan(&pendingCount, &maxSeq); err != nil {
+		return nil, fmt.Errorf("failed to check pending in-flight messages: %w", err)
+	}
+
+	result := &domain.HasPendingMessagesResult{
+		HasPending:        pendingCount > 0,
+		PendingCount:      pendingCount,
+		MaxSequenceNumber: maxSeq,
+	}
+
+	// 3. Se houver mensagens pendentes, agenda atomicamente a próxima execução durável
+	if pendingCount > 0 {
+		schedID := uuid.New().String()
+		scheduleQuery := `
+		INSERT INTO conversation_schedules (
+			id, tenant_id, conversation_id, scheduled_for, status, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, 'PENDING', $4, $4
+		)
+		ON CONFLICT (conversation_id)
+		DO UPDATE SET
+			scheduled_for = EXCLUDED.scheduled_for,
+			status = 'PENDING',
+			claimed_at = NULL,
+			updated_at = EXCLUDED.updated_at;
+		`
+		if _, err := tx.Exec(ctx, scheduleQuery, schedID, tenantID, conversationID, now); err != nil {
+			return nil, fmt.Errorf("failed to auto-schedule pending messages: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit release and schedule transaction: %w", err)
+	}
+
+	return result, nil
+}
+
 // ReconciledExecution representa uma execução resgatada pelo Reconciliador.
 type ReconciledExecution struct {
 	ID             string

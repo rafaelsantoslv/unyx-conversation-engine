@@ -781,6 +781,17 @@ func (m *mockCoordinatorTest) ReleaseExecutionWithFencing(ctx context.Context, e
 	return nil
 }
 
+func (m *mockCoordinatorTest) ReleaseExecutionAndSchedulePending(
+	ctx context.Context,
+	executionID string,
+	fencingToken int64,
+	tenantID, conversationID string,
+	watermarkSequence int64,
+	finalStatus domain.ExecutionStatus,
+) (*domain.HasPendingMessagesResult, error) {
+	return &domain.HasPendingMessagesResult{HasPending: false}, nil
+}
+
 type runtimeContextVerifier struct {
 	cancelledCh chan bool
 }

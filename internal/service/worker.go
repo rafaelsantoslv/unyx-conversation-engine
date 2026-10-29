@@ -62,6 +62,7 @@ type ConversationCoordinator interface {
 	RenewLease(ctx context.Context, executionID string, fencingToken int64, extension time.Duration) error
 	ReleaseExecution(ctx context.Context, executionID string, finalStatus domain.ExecutionStatus) error
 	ReleaseExecutionWithFencing(ctx context.Context, executionID string, fencingToken int64, finalStatus domain.ExecutionStatus) error
+	ReleaseExecutionAndSchedulePending(ctx context.Context, executionID string, fencingToken int64, tenantID, conversationID string, watermarkSequence int64, finalStatus domain.ExecutionStatus) (*domain.HasPendingMessagesResult, error)
 }
 
 // DefaultMessagePipelineHandler é a implementação do pipeline que orquestra coordenação distribuída,
@@ -304,10 +305,29 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		}()
 	}
 
+	var finalExecutionStatus = domain.ExecutionStatusSucceeded
+	var watermark int64 = seqNumber
+
 	// Libera a concessão distribuída ao finalizar (validando fencing_token se disponível)
+	// e agenda automaticamente ciclo subsequente caso novas mensagens in-flight tenham chegado (INV-01, INV-02, INV-10)
 	defer func() {
 		if h.coordinator != nil && activeExec != nil {
-			_ = h.coordinator.ReleaseExecutionWithFencing(context.Background(), activeExec.ID, activeExec.FencingToken, domain.ExecutionStatusSucceeded)
+			pendingRes, relErr := h.coordinator.ReleaseExecutionAndSchedulePending(
+				context.Background(),
+				activeExec.ID,
+				activeExec.FencingToken,
+				tenantID,
+				convID,
+				watermark,
+				finalExecutionStatus,
+			)
+			if relErr != nil {
+				// Fallback para liberação simples caso ocorra erro no agendamento
+				_ = h.coordinator.ReleaseExecutionWithFencing(context.Background(), activeExec.ID, activeExec.FencingToken, finalExecutionStatus)
+			} else if pendingRes != nil && pendingRes.HasPending {
+				log.Printf("[pipeline] in-flight messages detected during execution for conv %s (count=%d, max_seq=%d). Subsequence execution auto-scheduled! (INV-02, INV-10)",
+					convID, pendingRes.PendingCount, pendingRes.MaxSequenceNumber)
+			}
 		}
 	}()
 
@@ -316,7 +336,6 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 	// 4. Execução do Runtime (IA / Mock)
 	if h.runtime != nil {
 		var snapshotMsgs []*domain.Message
-		var watermark int64 = seqNumber
 		execReqID := ""
 
 		if h.execReqRepo != nil {
@@ -347,6 +366,7 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		execDuration := time.Since(start)
 
 		if err != nil {
+			finalExecutionStatus = domain.ExecutionStatusFailed
 			log.Printf("[pipeline] agent runtime failed for message %s: %v", msgID, err)
 			if h.resultsRepo != nil {
 				// Avalia retry durável com backoff exponencial e jitter (INV-05, INV-06)

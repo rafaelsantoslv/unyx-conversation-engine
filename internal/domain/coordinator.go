@@ -29,3 +29,10 @@ type ConversationExecution struct {
 	MaxAttempts    int             `json:"max_attempts"`
 	UpdatedAt      time.Time       `json:"updated_at"`
 }
+
+// HasPendingMessagesResult indica se há mensagens pendentes pós-watermark e se uma nova execução foi agendada.
+type HasPendingMessagesResult struct {
+	HasPending        bool  `json:"has_pending"`
+	PendingCount      int   `json:"pending_count"`
+	MaxSequenceNumber int64 `json:"max_sequence_number"`
+}
