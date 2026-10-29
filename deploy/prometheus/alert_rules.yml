@@ -1,0 +1,113 @@
+groups:
+  - name: conversation_engine_operational_alerts
+    rules:
+      # 1. OutboxStuck: Backlog de outbox_events pendentes com mais de 3 minutos sem redução
+      - alert: OutboxStuck
+        expr: sum(outbox_events_pending_count) > 0 and rate(outbox_events_published_total[3m]) == 0
+        for: 3m
+        labels:
+          severity: critical
+          service: outbox-publisher
+        annotations:
+          summary: "Transactional Outbox events are stuck without dispatch"
+          description: "Outbox pending events count is > 0 and no events have been published to Kafka for 3+ minutes."
+          runbook_url: "https://docs.unyx.io/ops/runbooks/outbox-stuck.md"
+
+      # 2. KafkaConsumerLagHigh: Consumer lag superior a 500 mensagens por mais de 2 minutos
+      - alert: KafkaConsumerLagHigh
+        expr: sum(kafka_consumer_lag_records) by (consumer_group, topic) > 500
+        for: 2m
+        labels:
+          severity: high
+          service: kafka
+        annotations:
+          summary: "Kafka consumer lag exceeded threshold"
+          description: "Consumer group '{{ $labels.consumer_group }}' lag on topic '{{ $labels.topic }}' has exceeded 500 records for 2+ minutes."
+          runbook_url: "https://docs.unyx.io/ops/runbooks/kafka-consumer-lag.md"
+
+      # 3. ConversationWorkerFrozen: Zero mensagens processadas com lag crescente no Kafka
+      - alert: ConversationWorkerFrozen
+        expr: sum(rate(kafka_messages_consumed_total[2m])) == 0 and sum(kafka_consumer_lag_records) > 0
+        for: 2m
+        labels:
+          severity: critical
+          service: conversation-worker
+        annotations:
+          summary: "Conversation Workers appear frozen or unresponsive"
+          description: "Worker message consumption rate is 0 while there is pending consumer lag in Kafka."
+          runbook_url: "https://docs.unyx.io/ops/runbooks/worker-frozen.md"
+
+      # 4. OutboundDeliveryFailing: Taxa de falhas HTTP na entrega ao Chatwoot > 10% nos últimos 5 minutos
+      - alert: OutboundDeliveryFailing
+        expr: |
+          (
+            sum(rate(outbound_intents_total{status="failed"}[5m]))
+            /
+            sum(rate(outbound_intents_total[5m]))
+          ) * 100 > 10
+        for: 5m
+        labels:
+          severity: high
+          service: outbound-worker
+        annotations:
+          summary: "Outbound message delivery error rate > 10%"
+          description: "Over 10% of outbound messages to external channel (Chatwoot) failed in the last 5 minutes."
+          runbook_url: "https://docs.unyx.io/ops/runbooks/outbound-delivery-failing.md"
+
+      # 5. ChatwootRateLimited: Taxa de HTTP 429 persistente por mais de 2 minutos
+      - alert: ChatwootRateLimited
+        expr: sum(rate(outbound_intents_total{status="rate_limited"}[2m])) > 0
+        for: 2m
+        labels:
+          severity: medium
+          service: outbound-worker
+        annotations:
+          summary: "External provider Chatwoot is rate limiting outbound requests"
+          description: "HTTP 429 Too Many Requests encountered persistently during outbound dispatch."
+          runbook_url: "https://docs.unyx.io/ops/runbooks/chatwoot-rate-limit.md"
+
+      # 6. HighRetryRate: Taxa de retries superior a 15% das execuções
+      - alert: HighRetryRate
+        expr: |
+          (
+            sum(rate(conversation_retries_total[5m]))
+            /
+            sum(rate(conversation_executions_total[5m]))
+          ) * 100 > 15
+        for: 5m
+        labels:
+          severity: medium
+          service: core-engine
+        annotations:
+          summary: "Elevated retry rate detected across engine operations"
+          description: "Retry attempts represent more than 15% of total executions over a 5-minute window."
+          runbook_url: "https://docs.unyx.io/ops/runbooks/high-retry-rate.md"
+
+      # 7. QuarantineEventsSpike: Mais de 5 eventos enviados para quarentena em 10 minutos
+      - alert: QuarantineEventsSpike
+        expr: sum(increase(quarantine_events_total[10m])) > 5
+        for: 1m
+        labels:
+          severity: high
+          service: ingestion-api
+        annotations:
+          summary: "Spike in poisoned or corrupted payloads quarantined"
+          description: "More than 5 invalid/poisoned payloads sent to quarantine dead-letter within 10 minutes."
+          runbook_url: "https://docs.unyx.io/ops/runbooks/quarantine-spike.md"
+
+      # 8. PostgresPoolExhaustion: Conexões ativas do pgxpool acima de 85% da capacidade
+      - alert: PostgresPoolExhaustion
+        expr: |
+          (
+            go_sql_connections_in_use
+            /
+            go_sql_connections_max_open
+          ) * 100 > 85
+        for: 2m
+        labels:
+          severity: high
+          service: storage-postgres
+        annotations:
+          summary: "PostgreSQL connection pool near exhaustion"
+          description: "Active database connections have exceeded 85% of total pool capacity for 2+ minutes."
+          runbook_url: "https://docs.unyx.io/ops/runbooks/postgres-pool-exhaustion.md"
