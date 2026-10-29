@@ -37,4 +37,5 @@ type ProcessingResult struct {
 	CompletedAt     *time.Time      `json:"completed_at,omitempty"`
 	UpdatedAt       time.Time       `json:"updated_at"`
 	LeaseExpiresAt  *time.Time      `json:"lease_expires_at,omitempty"`
+	FencingToken    *int64          `json:"fencing_token,omitempty"`
 }

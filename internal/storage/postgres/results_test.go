@@ -36,6 +36,10 @@ func TestResultsRepository_Integration(t *testing.T) {
 		return
 	}
 
+	if err := postgres.RunMigrations(ctx, pool, "../../../migrations"); err != nil {
+		_ = postgres.RunMigrations(ctx, pool, "migrations")
+	}
+
 	repo := postgres.NewRepository(pool)
 	resultsRepo := postgres.NewResultsRepository(pool)
 
@@ -199,6 +203,55 @@ func TestResultsRepository_Integration(t *testing.T) {
 		// Exatamente 1 worker deve ter conseguido o lock inicial
 		if acquiredCount != 1 {
 			t.Fatalf("expected exactly 1 worker to acquire lock, got %d", acquiredCount)
+		}
+	})
+
+	t.Run("persist result with stale fencing token rejected (INV-04)", func(t *testing.T) {
+		fencingMsgID := uuid.New().String()
+		fencingMsg := &domain.Message{
+			ID:                fencingMsgID,
+			TenantID:          tenantID,
+			ConversationID:    conv.ID,
+			ExternalMessageID: fmt.Sprintf("ext-fence-%d", time.Now().UnixNano()),
+			Role:              domain.RoleUser,
+			Content:           "Mensagem com fencing",
+		}
+		_, err := repo.SaveMessage(ctx, fencingMsg)
+		if err != nil {
+			t.Fatalf("failed to insert message: %v", err)
+		}
+
+		token1 := int64(10)
+		token2 := int64(11)
+
+		// Adquire com token 10
+		_, err = resultsRepo.AcquireExecutionLockWithSeqAndFencing(ctx, tenantID, conv.ID, fencingMsgID, 1, 30*time.Second, &token1)
+		if err != nil {
+			t.Fatalf("failed to acquire with fencing token 10: %v", err)
+		}
+
+		// Simula Worker 2 assumindo com token 11 (atualiza fencing_token da linha)
+		_, err = pool.Exec(ctx, "UPDATE processing_results SET fencing_token = $1 WHERE tenant_id = $2 AND conversation_id = $3 AND message_id = $4",
+			token2, tenantID, conv.ID, fencingMsgID)
+		if err != nil {
+			t.Fatalf("failed to update fencing token to 11: %v", err)
+		}
+
+		// Worker 1 (token 10) tenta gravar sucesso e deve ser REJEITADO
+		dummyOutput := map[string]string{"reply": "zombie worker reply"}
+		errZombieWrite := resultsRepo.RecordExecutionSuccessWithFencing(ctx, tenantID, conv.ID, fencingMsgID, dummyOutput, 500*time.Millisecond, token1)
+		if errZombieWrite == nil {
+			t.Fatalf("expected ErrFencingTokenStale for worker with outdated token 10, got nil")
+		}
+		if errZombieWrite != domain.ErrFencingTokenStale {
+			t.Fatalf("expected ErrFencingTokenStale, got: %v", errZombieWrite)
+		}
+
+		// Worker 2 (token 11) grava sucesso e é ACEITO
+		validOutput := map[string]string{"reply": "valid worker reply"}
+		errValidWrite := resultsRepo.RecordExecutionSuccessWithFencing(ctx, tenantID, conv.ID, fencingMsgID, validOutput, 600*time.Millisecond, token2)
+		if errValidWrite != nil {
+			t.Fatalf("expected success for worker with token 11, got: %v", errValidWrite)
 		}
 	})
 }

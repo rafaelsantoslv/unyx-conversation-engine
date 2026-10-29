@@ -102,6 +102,10 @@ func (m *mockResultsRepo) IsPrecedingSequenceCompleted(ctx context.Context, conv
 }
 
 func (m *mockResultsRepo) AcquireExecutionLockWithSeq(ctx context.Context, tenantID, conversationID, messageID string, sequenceNumber int64, leaseDuration time.Duration) (*domain.ProcessingResult, error) {
+	return m.AcquireExecutionLockWithSeqAndFencing(ctx, tenantID, conversationID, messageID, sequenceNumber, leaseDuration, nil)
+}
+
+func (m *mockResultsRepo) AcquireExecutionLockWithSeqAndFencing(ctx context.Context, tenantID, conversationID, messageID string, sequenceNumber int64, leaseDuration time.Duration, fencingToken *int64) (*domain.ProcessingResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.saveErr != nil {
@@ -121,6 +125,7 @@ func (m *mockResultsRepo) AcquireExecutionLockWithSeq(ctx context.Context, tenan
 		MessageID:      messageID,
 		SequenceNumber: sequenceNumber,
 		Status:         domain.ExecutionStatusRunning,
+		FencingToken:   fencingToken,
 		CreatedAt:      time.Now(),
 	}
 	m.results[key] = res
@@ -136,6 +141,10 @@ func (m *mockResultsRepo) RecordExecutionStart(ctx context.Context, tenantID, co
 }
 
 func (m *mockResultsRepo) RecordExecutionSuccess(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, execTime time.Duration) error {
+	return m.RecordExecutionSuccessWithFencing(ctx, tenantID, conversationID, messageID, output, execTime, 0)
+}
+
+func (m *mockResultsRepo) RecordExecutionSuccessWithFencing(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, execTime time.Duration, fencingToken int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.saveErr != nil {
@@ -144,6 +153,9 @@ func (m *mockResultsRepo) RecordExecutionSuccess(ctx context.Context, tenantID, 
 	m.successCalls++
 	key := tenantID + ":" + conversationID + ":" + messageID
 	if res, ok := m.results[key]; ok {
+		if fencingToken > 0 && res.FencingToken != nil && *res.FencingToken > fencingToken {
+			return domain.ErrFencingTokenStale
+		}
 		res.Status = domain.ExecutionStatusSucceeded
 		res.ExecutionTimeMS = execTime.Milliseconds()
 	}
@@ -151,6 +163,10 @@ func (m *mockResultsRepo) RecordExecutionSuccess(ctx context.Context, tenantID, 
 }
 
 func (m *mockResultsRepo) RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failErr error, execTime time.Duration) error {
+	return m.RecordExecutionFailureWithFencing(ctx, tenantID, conversationID, messageID, failErr, execTime, 0)
+}
+
+func (m *mockResultsRepo) RecordExecutionFailureWithFencing(ctx context.Context, tenantID, conversationID, messageID string, failErr error, execTime time.Duration, fencingToken int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.saveErr != nil {
@@ -159,6 +175,9 @@ func (m *mockResultsRepo) RecordExecutionFailure(ctx context.Context, tenantID, 
 	m.failureCalls++
 	key := tenantID + ":" + conversationID + ":" + messageID
 	if res, ok := m.results[key]; ok {
+		if fencingToken > 0 && res.FencingToken != nil && *res.FencingToken > fencingToken {
+			return domain.ErrFencingTokenStale
+		}
 		res.Status = domain.ExecutionStatusFailed
 		res.ExecutionTimeMS = execTime.Milliseconds()
 	}
@@ -416,4 +435,111 @@ func TestDefaultMessagePipelineHandler_OrderingAndIdempotency(t *testing.T) {
 			t.Errorf("expected 3 runtime calls for distinct conversations, got %d", runtime.calls)
 		}
 	})
+
+	t.Run("heartbeat and cooperative cancellation on stale fencing token (INV-04)", func(t *testing.T) {
+		resultsRepo := newMockResultsRepo()
+		mockCoord := &mockCoordinatorTest{
+			activeExec: &domain.ConversationExecution{
+				ID:             "exec-1",
+				TenantID:       "tenant-1",
+				ConversationID: "conv-hb",
+				WorkerID:       "worker-test",
+				Status:         domain.ExecutionStatusRunning,
+				FencingToken:   10,
+			},
+		}
+
+		// Runtime que demora e verifica se o contexto é cancelado pelo heartbeat
+		contextCancelledCh := make(chan bool, 1)
+		runtimeWithContextCheck := &runtimeContextVerifier{
+			cancelledCh: contextCancelledCh,
+		}
+
+		pipeline := service.NewDefaultMessagePipelineHandler(
+			runtimeWithContextCheck,
+			resultsRepo,
+			service.WithCoordinator(mockCoord, "worker-test"),
+			service.WithLeaseSettings(500*time.Millisecond, 20*time.Millisecond),
+		)
+
+		// Simula que o lease sofreu fencing stale no heartbeat
+		mockCoord.failRenewWithStale = true
+
+		evt := domain.Event[domain.MessageReceivedPayload]{
+			EventID:        "evt-hb",
+			TenantID:       "tenant-1",
+			ConversationID: "conv-hb",
+			EventType:      domain.EventTypeMessageReceived,
+			OccurredAt:     time.Now(),
+			Payload: domain.MessageReceivedPayload{
+				MessageID:      "msg-hb",
+				SequenceNumber: 1,
+				Content:        "Teste Heartbeat",
+				Role:           domain.RoleUser,
+			},
+		}
+
+		_ = pipeline.HandleMessageReceived(ctx, evt)
+
+		select {
+		case cancelled := <-contextCancelledCh:
+			if !cancelled {
+				t.Fatalf("expected context to be cancelled due to stale fencing token")
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for cooperative cancellation")
+		}
+	})
+}
+
+type mockCoordinatorTest struct {
+	mu                 sync.Mutex
+	activeExec         *domain.ConversationExecution
+	failRenewWithStale bool
+	renewCalls         int
+}
+
+func (m *mockCoordinatorTest) AcquireExecution(ctx context.Context, tenantID, conversationID, workerID string, leaseDuration time.Duration) (*domain.ConversationExecution, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeExec, nil
+}
+
+func (m *mockCoordinatorTest) RenewLease(ctx context.Context, executionID string, fencingToken int64, extension time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.renewCalls++
+	if m.failRenewWithStale {
+		return domain.ErrFencingTokenStale
+	}
+	return nil
+}
+
+func (m *mockCoordinatorTest) ReleaseExecution(ctx context.Context, executionID string, finalStatus domain.ExecutionStatus) error {
+	return nil
+}
+
+func (m *mockCoordinatorTest) ReleaseExecutionWithFencing(ctx context.Context, executionID string, fencingToken int64, finalStatus domain.ExecutionStatus) error {
+	return nil
+}
+
+type runtimeContextVerifier struct {
+	cancelledCh chan bool
+}
+
+func (r *runtimeContextVerifier) Execute(ctx context.Context, input domain.ExecutionInput) (*domain.ExecutionOutput, error) {
+	select {
+	case <-ctx.Done():
+		r.cancelledCh <- true
+		return nil, ctx.Err()
+	case <-time.After(250 * time.Millisecond):
+		select {
+		case <-ctx.Done():
+			r.cancelledCh <- true
+			return nil, ctx.Err()
+		default:
+			r.cancelledCh <- false
+			return &domain.ExecutionOutput{ResponseContent: "done"}, nil
+		}
+	}
 }

@@ -29,6 +29,10 @@ func TestExecutionCoordinator_Integration(t *testing.T) {
 	}
 	defer pool.Close()
 
+	if err := postgres.RunMigrations(ctx, pool, "../../../migrations"); err != nil {
+		_ = postgres.RunMigrations(ctx, pool, "migrations")
+	}
+
 	repo := postgres.NewRepository(pool)
 	coordinator := postgres.NewExecutionCoordinator(pool)
 
@@ -132,6 +136,70 @@ func TestExecutionCoordinator_Integration(t *testing.T) {
 		}
 		if busyCount != numWorkers-1 {
 			t.Fatalf("expected %d workers to receive ErrConversationBusy, got %d", numWorkers-1, busyCount)
+		}
+	})
+
+	t.Run("fencing token monotonic increment and zombie worker protection (INV-04)", func(t *testing.T) {
+		fencingConv, err := repo.GetOrCreateConversation(ctx, tenantID, "conv-fencing-test")
+		if err != nil {
+			t.Fatalf("failed to create conv: %v", err)
+		}
+
+		// 1. Worker 1 adquire com lease curto (1 segundo)
+		exec1, err := coordinator.AcquireExecution(ctx, tenantID, fencingConv.ID, "worker-1", 1*time.Second)
+		if err != nil {
+			t.Fatalf("worker 1 should acquire execution: %v", err)
+		}
+		if exec1.FencingToken <= 0 {
+			t.Fatalf("expected positive fencing token, got %d", exec1.FencingToken)
+		}
+		token1 := exec1.FencingToken
+
+		// Worker 1 testa heartbeat/renovação de lease válido
+		err = coordinator.RenewLease(ctx, exec1.ID, token1, 2*time.Second)
+		if err != nil {
+			t.Fatalf("worker 1 failed to renew valid lease: %v", err)
+		}
+
+		// Força o relógio/expiração do lease no banco para simular pausa de GC / falha de rede do Worker 1
+		_, err = pool.Exec(ctx, "UPDATE conversation_executions SET expires_at = NOW() - INTERVAL '5 seconds' WHERE id = $1", exec1.ID)
+		if err != nil {
+			t.Fatalf("failed to artificially expire lease: %v", err)
+		}
+
+		// 2. Worker 2 assume a execução expirada como órfã
+		exec2, err := coordinator.AcquireExecution(ctx, tenantID, fencingConv.ID, "worker-2", 10*time.Second)
+		if err != nil {
+			t.Fatalf("worker 2 should take over expired execution: %v", err)
+		}
+
+		token2 := exec2.FencingToken
+		if token2 <= token1 {
+			t.Fatalf("expected monotonic fencing token increment: token2 (%d) should be > token1 (%d)", token2, token1)
+		}
+
+		// 3. Worker 1 'acorda' da pausa zumbi e tenta renovar o lease com o token defasado
+		errZombieRenew := coordinator.RenewLease(ctx, exec1.ID, token1, 10*time.Second)
+		if errZombieRenew == nil {
+			t.Fatalf("expected ErrFencingTokenStale for zombie worker renewal, got nil")
+		}
+		if errZombieRenew != domain.ErrFencingTokenStale {
+			t.Fatalf("expected ErrFencingTokenStale, got: %v", errZombieRenew)
+		}
+
+		// 4. Worker 1 'acorda' e tenta liberar com token defasado
+		errZombieRelease := coordinator.ReleaseExecutionWithFencing(ctx, exec1.ID, token1, domain.ExecutionStatusSucceeded)
+		if errZombieRelease == nil {
+			t.Fatalf("expected ErrFencingTokenStale for zombie worker release, got nil")
+		}
+		if errZombieRelease != domain.ErrFencingTokenStale {
+			t.Fatalf("expected ErrFencingTokenStale, got: %v", errZombieRelease)
+		}
+
+		// Worker 2 conclui com sucesso com seu token válido
+		err = coordinator.ReleaseExecutionWithFencing(ctx, exec2.ID, token2, domain.ExecutionStatusSucceeded)
+		if err != nil {
+			t.Fatalf("worker 2 failed to release with valid token: %v", err)
 		}
 	})
 }

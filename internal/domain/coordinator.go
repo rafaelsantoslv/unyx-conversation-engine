@@ -8,6 +8,10 @@ import (
 var (
 	// ErrConversationBusy indica que outra instância/worker já possui a concessão ativa desta conversa.
 	ErrConversationBusy = errors.New("conversation is currently locked by another worker")
+
+	// ErrFencingTokenStale indica que a tentativa de persistência ou renovação foi rejeitada
+	// porque outro worker assumiu a execução com uma geração / fencing token maior (INV-04).
+	ErrFencingTokenStale = errors.New("fencing token is stale: execution was taken over by another worker")
 )
 
 // ConversationExecution representa a concessão distribuída ativa de uma conversa.
@@ -20,4 +24,5 @@ type ConversationExecution struct {
 	AcquiredAt     time.Time       `json:"acquired_at"`
 	ReleasedAt     *time.Time      `json:"released_at,omitempty"`
 	ExpiresAt      time.Time       `json:"expires_at"`
+	FencingToken   int64           `json:"fencing_token"`
 }
