@@ -25,7 +25,8 @@ var (
 //   -> AI_ACTIVE (retorno para automação / devolução)
 //   -> CLOSED (resolução pelo operador humano)
 // CLOSED:
-//   -> AI_ACTIVE (reabertura pelo cliente via nova mensagem)
+//   -> AI_ACTIVE (reabertura pelo cliente via nova mensagem ou comando explícito)
+//   -> HUMAN_ACTIVE (reabertura direta para operador)
 var AllowedTransitions = map[ConversationState][]ConversationState{
 	StateAIActive: {
 		StateHumanActive,
@@ -37,6 +38,7 @@ var AllowedTransitions = map[ConversationState][]ConversationState{
 	},
 	StateClosed: {
 		StateAIActive,
+		StateHumanActive,
 	},
 }
 
@@ -103,11 +105,22 @@ type LifecycleCommand struct {
 // LifecycleEventType tipa os eventos de ciclo de vida já consumados.
 type LifecycleEventType string
 
+// ConversationStateHistory representa o registro auditável e imutável de transição de estado da conversa.
+type ConversationStateHistory struct {
+	ID             string            `json:"id"`
+	TenantID       string            `json:"tenant_id"`
+	ConversationID string            `json:"conversation_id"`
+	FromState      ConversationState `json:"from_state"`
+	ToState        ConversationState `json:"to_state"`
+	Reason         string            `json:"reason"`
+	ChangedBy      string            `json:"changed_by"`
+	FromVersion    int64             `json:"from_version"`
+	ToVersion      int64             `json:"to_version"`
+	CreatedAt      time.Time         `json:"created_at"`
+}
+
 const (
-	EventConversationTransferred LifecycleEventType = "conversation.transferred"
-	EventConversationReturnedToAI LifecycleEventType = "conversation.returned_to_ai"
-	EventConversationClosed      LifecycleEventType = "conversation.closed"
-	EventConversationReopened    LifecycleEventType = "conversation.reopened"
+	EventTypeConversationStateChanged = "conversation.state.changed"
 )
 
 // LifecycleEvent registra a transição de estado consumada no motor.

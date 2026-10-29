@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -324,4 +325,228 @@ func (r *Repository) GetMessageByExternalID(ctx context.Context, tenantID, exter
 	}
 	msg.Role = domain.MessageRole(roleStr)
 	return &msg, nil
+}
+
+// TransitionConversationState executa uma transição formal na FSM da conversa com:
+// 1. Validação de guardas de domínio (CanTransition).
+// 2. Concorrência otimista estrita via versionamento (expectedVersion).
+// 3. Registro auditável imutável na tabela conversation_state_history.
+// 4. Emissão atômica do evento conversation.state.changed na outbox_events.
+func (r *Repository) TransitionConversationState(
+	ctx context.Context,
+	tenantID, conversationID string,
+	toState domain.ConversationState,
+	expectedVersion int64,
+	reason string,
+	changedBy string,
+) (*domain.Conversation, error) {
+	if !toState.IsValid() {
+		return nil, domain.ErrInvalidConversationState
+	}
+	if strings.TrimSpace(changedBy) == "" {
+		changedBy = "system"
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "state transition requested"
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	// 1. Busca estado atual com lock FOR UPDATE para concorrência segura
+	var conv domain.Conversation
+	var statusStr string
+	var metaBytes []byte
+	selectQuery := `
+	SELECT id, tenant_id, COALESCE(user_id, ''), external_id, channel, status, version, metadata, created_at, updated_at
+	FROM conversations
+	WHERE tenant_id = $1 AND id = $2
+	FOR UPDATE;
+	`
+	err = tx.QueryRow(ctx, selectQuery, tenantID, conversationID).Scan(
+		&conv.ID,
+		&conv.TenantID,
+		&conv.UserID,
+		&conv.ExternalConversationID,
+		&conv.Channel,
+		&statusStr,
+		&conv.Version,
+		&metaBytes,
+		&conv.CreatedAt,
+		&conv.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("conversation %s not found: %w", conversationID, err)
+		}
+		return nil, fmt.Errorf("failed to lock conversation for transition: %w", err)
+	}
+
+	fromState := domain.ConversationState(statusStr)
+	fromVersion := conv.Version
+
+	// 2. Validação da guarda da FSM
+	if !domain.CanTransition(fromState, toState) {
+		return nil, fmt.Errorf("%w: cannot transition from %s to %s", domain.ErrInvalidStateTransition, fromState, toState)
+	}
+
+	// 3. Validação de Concorrência Otimista (State Versioning)
+	if expectedVersion > 0 && conv.Version != expectedVersion {
+		return nil, fmt.Errorf("%w: expected version %d, but current version is %d", domain.ErrStateVersionMismatch, expectedVersion, conv.Version)
+	}
+
+	// Se transição for idempotente (fromState == toState), não precisa alterar nada
+	if fromState == toState {
+		conv.State = fromState
+		if len(metaBytes) > 0 {
+			_ = json.Unmarshal(metaBytes, &conv.Metadata)
+		}
+		return &conv, nil
+	}
+
+	now := time.Now().UTC()
+	nextVersion := conv.Version + 1
+
+	// 4. Atualiza o estado da conversa e incrementa versão
+	updateQuery := `
+	UPDATE conversations
+	SET status = $1, version = $2, updated_at = $3
+	WHERE tenant_id = $4 AND id = $5 AND version = $6;
+	`
+	cmdTag, err := tx.Exec(ctx, updateQuery, string(toState), nextVersion, now, tenantID, conversationID, fromVersion)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update conversation state: %w", err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		return nil, domain.ErrStateVersionMismatch
+	}
+
+	conv.State = toState
+	conv.Version = nextVersion
+	conv.UpdatedAt = now
+	if len(metaBytes) > 0 {
+		_ = json.Unmarshal(metaBytes, &conv.Metadata)
+	}
+
+	// 5. Registra no histórico de auditoria (conversation_state_history)
+	historyID := uuid.New().String()
+	historyQuery := `
+	INSERT INTO conversation_state_history (
+		id, tenant_id, conversation_id, from_state, to_state, reason, changed_by, from_version, to_version, created_at
+	) VALUES (
+		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+	);
+	`
+	_, err = tx.Exec(ctx, historyQuery,
+		historyID,
+		tenantID,
+		conversationID,
+		string(fromState),
+		string(toState),
+		reason,
+		changedBy,
+		fromVersion,
+		nextVersion,
+		now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert conversation state history: %w", err)
+	}
+
+	// 6. Insere evento de domínio conversation.state.changed na outbox_events
+	lifecycleEvt := domain.Event[domain.LifecycleEvent]{
+		EventID:        uuid.New().String(),
+		TenantID:       tenantID,
+		ConversationID: conversationID,
+		EventType:      domain.EventTypeConversationStateChanged,
+		Version:        domain.EventVersionV1,
+		OccurredAt:     now,
+		Payload: domain.LifecycleEvent{
+			EventID:        uuid.New().String(),
+			TenantID:       tenantID,
+			ConversationID: conversationID,
+			EventType:      domain.LifecycleEventType(domain.EventTypeConversationStateChanged),
+			PreviousState:  fromState,
+			CurrentState:   toState,
+			Version:        nextVersion,
+			Reason:         reason,
+			OccurredAt:     now,
+		},
+	}
+	payloadBytes, err := json.Marshal(lifecycleEvt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal state changed event: %w", err)
+	}
+
+	outboxID := uuid.New().String()
+	insertOutbox := `
+	INSERT INTO outbox_events (
+		id, tenant_id, conversation_id, event_type, payload, partition_key, status, retry_count, created_at
+	) VALUES (
+		$1, $2, $3, $4, $5, $6, 'PENDING', 0, $7
+	);
+	`
+	_, err = tx.Exec(ctx, insertOutbox,
+		outboxID,
+		tenantID,
+		conversationID,
+		domain.EventTypeConversationStateChanged,
+		payloadBytes,
+		conversationID,
+		now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert state changed event into outbox: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit transition transaction: %w", err)
+	}
+
+	return &conv, nil
+}
+
+// GetConversationStateHistory recupera a trilha auditável de transições de uma conversa.
+func (r *Repository) GetConversationStateHistory(ctx context.Context, tenantID, conversationID string) ([]domain.ConversationStateHistory, error) {
+	query := `
+	SELECT id, tenant_id, conversation_id, from_state, to_state, reason, changed_by, from_version, to_version, created_at
+	FROM conversation_state_history
+	WHERE tenant_id = $1 AND conversation_id = $2
+	ORDER BY created_at ASC, to_version ASC;
+	`
+	rows, err := r.pool.Query(ctx, query, tenantID, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query state history: %w", err)
+	}
+	defer rows.Close()
+
+	var history []domain.ConversationStateHistory
+	for rows.Next() {
+		var h domain.ConversationStateHistory
+		var fromStr, toStr string
+		err := rows.Scan(
+			&h.ID,
+			&h.TenantID,
+			&h.ConversationID,
+			&fromStr,
+			&toStr,
+			&h.Reason,
+			&h.ChangedBy,
+			&h.FromVersion,
+			&h.ToVersion,
+			&h.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan state history row: %w", err)
+		}
+		h.FromState = domain.ConversationState(fromStr)
+		h.ToState = domain.ConversationState(toStr)
+		history = append(history, h)
+	}
+	return history, rows.Err()
 }

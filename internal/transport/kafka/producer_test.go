@@ -77,6 +77,9 @@ func TestOutboxPublisher_Integration(t *testing.T) {
 	kafkaPub := transkafka.NewKafkaPublisher(brokers)
 	defer kafkaPub.Close()
 
+	// Limpa quaisquer eventos pendentes residuais de outros testes para isolamento estrito
+	_, _ = dbPool.Exec(ctx, "DELETE FROM outbox_events WHERE status = 'PENDING'")
+
 	pubService := service.NewOutboxPublisherService(
 		repo,
 		kafkaPub,

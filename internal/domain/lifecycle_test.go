@@ -24,6 +24,7 @@ func TestConversationLifecycle_StateTransitions(t *testing.T) {
 			{"HUMAN_ACTIVE -> AI_ACTIVE (returned to AI)", domain.StateHumanActive, domain.StateAIActive},
 			{"HUMAN_ACTIVE -> CLOSED (resolved by human)", domain.StateHumanActive, domain.StateClosed},
 			{"CLOSED -> AI_ACTIVE (customer reopens)", domain.StateClosed, domain.StateAIActive},
+			{"CLOSED -> HUMAN_ACTIVE (reopens directly to operator)", domain.StateClosed, domain.StateHumanActive},
 			{"Idempotent AI_ACTIVE -> AI_ACTIVE", domain.StateAIActive, domain.StateAIActive},
 			{"Idempotent HUMAN_ACTIVE -> HUMAN_ACTIVE", domain.StateHumanActive, domain.StateHumanActive},
 			{"Idempotent CLOSED -> CLOSED", domain.StateClosed, domain.StateClosed},
@@ -63,8 +64,8 @@ func TestConversationLifecycle_StateTransitions(t *testing.T) {
 			from domain.ConversationState
 			to   domain.ConversationState
 		}{
-			{"CLOSED -> HUMAN_ACTIVE (cannot jump directly to human without reopening to AI first)", domain.StateClosed, domain.StateHumanActive},
 			{"Unknown state -> AI_ACTIVE", domain.ConversationState("UNKNOWN"), domain.StateAIActive},
+			{"AI_ACTIVE -> Unknown state", domain.StateAIActive, domain.ConversationState("UNKNOWN")},
 		}
 
 		for _, tc := range invalidCases {
