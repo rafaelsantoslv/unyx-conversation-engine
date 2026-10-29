@@ -572,3 +572,47 @@ func (r *Repository) GetConversationStateHistory(ctx context.Context, tenantID, 
 	}
 	return history, rows.Err()
 }
+
+func (r *Repository) GetConversationByID(ctx context.Context, id string) (*domain.Conversation, error) {
+	if id == "" {
+		return nil, errors.New("conversation id must not be empty")
+	}
+
+	query := `
+	SELECT id, tenant_id, COALESCE(user_id, ''), external_id, channel, status, version, resumed_at_sequence, metadata, created_at, updated_at
+	FROM conversations
+	WHERE id = $1;
+	`
+
+	var conv domain.Conversation
+	var statusStr string
+	var metaBytes []byte
+
+	err := r.pool.QueryRow(ctx, query, id).Scan(
+		&conv.ID,
+		&conv.TenantID,
+		&conv.UserID,
+		&conv.ExternalConversationID,
+		&conv.Channel,
+		&statusStr,
+		&conv.Version,
+		&conv.ResumedAtSequence,
+		&metaBytes,
+		&conv.CreatedAt,
+		&conv.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("conversation %s not found: %w", id, err)
+		}
+		return nil, fmt.Errorf("failed to query conversation by id: %w", err)
+	}
+
+	conv.State = domain.ConversationState(statusStr)
+	if len(metaBytes) > 0 {
+		_ = json.Unmarshal(metaBytes, &conv.Metadata)
+	}
+
+	return &conv, nil
+}
+
