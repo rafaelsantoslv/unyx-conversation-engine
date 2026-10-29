@@ -232,9 +232,8 @@ func isAmbiguousNetworkError(err error) bool {
 }
 
 
-// Start inicia o loop contínuo do Outbound Worker com suporte a cancelamento de contexto.
+// Start inicia o loop contínuo do Outbound Worker com suporte a cancelamento de contexto e graceful drainage.
 func (w *OutboundWorkerService) Start(ctx context.Context) {
-
 	log.Printf("[outbound-worker] started (poll_interval=%v, batch_size=%d)...", w.pollInterval, w.batchSize)
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
@@ -245,7 +244,12 @@ func (w *OutboundWorkerService) Start(ctx context.Context) {
 			log.Println("[outbound-worker] stopping...")
 			return
 		case <-ticker.C:
-			_, _ = w.ProcessBatch(ctx)
+			// Cria um contexto com timeout independente de 15 segundos para a rodada de batch
+			// garantindo que se o processo receber SIGTERM enquanto uma chamada HTTP estiver em voo,
+			// a tarefa atual tenha até 15s para ser concluída e persistida com integridade (INV-04, INV-06).
+			batchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			_, _ = w.ProcessBatch(batchCtx)
+			cancel()
 		}
 	}
 }

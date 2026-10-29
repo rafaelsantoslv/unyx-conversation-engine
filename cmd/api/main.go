@@ -44,25 +44,13 @@ func main() {
 	msgHandler := handler.NewMessageHandler(ingestionSvc)
 	chatwootHandler := handler.NewChatwootWebhookHandler(ingestionSvc, integrationRepo)
 
+	healthHandler := handler.NewHealthHandler(dbPool)
+
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := dbPool.Ping(r.Context()); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"degraded","service":"api","error":"database unreachable"}`))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok","service":"api"}`))
-	})
-
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"alive","service":"api"}`))
-	})
+	mux.HandleFunc("/healthz", healthHandler.LivenessHandler)
+	mux.HandleFunc("/livez", healthHandler.LivenessHandler)
+	mux.HandleFunc("/readyz", healthHandler.ReadinessHandler)
 
 	mux.HandleFunc("/v1/messages", msgHandler.HandleIngest)
 	mux.HandleFunc("/v1/integrations/chatwoot/webhooks/", chatwootHandler.HandleWebhook)
@@ -87,7 +75,7 @@ func main() {
 	<-ctx.Done()
 	log.Println("shutting down api server gracefully...")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {

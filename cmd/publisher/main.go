@@ -15,6 +15,7 @@ import (
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/config"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/service"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/storage/postgres"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/http/handler"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/kafka"
 )
 
@@ -56,24 +57,11 @@ func main() {
 	)
 
 	// 3. Servidor HTTP de Health Check e Métricas/Liveness
+	healthHandler := handler.NewHealthHandler(dbPool)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := dbPool.Ping(r.Context()); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"degraded","error":%q}`, err.Error())))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok","service":"publisher"}`))
-	})
-
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"alive","service":"publisher"}`))
-	})
+	mux.HandleFunc("/healthz", healthHandler.LivenessHandler)
+	mux.HandleFunc("/livez", healthHandler.LivenessHandler)
+	mux.HandleFunc("/readyz", healthHandler.ReadinessHandler)
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -98,7 +86,7 @@ func main() {
 	<-ctx.Done()
 	log.Println("shutting down publisher service gracefully...")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
