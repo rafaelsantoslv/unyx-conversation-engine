@@ -1,0 +1,127 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Worker Pool & Execution Throughput",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 1 },
+      "id": 2,
+      "title": "Active Worker Routines",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(active_workers_count) by (worker_type)",
+          "legendFormat": "{{worker_type}}"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "reqps"
+        }
+      },
+      "gridPos": { "h": 6, "w": 16, "x": 8, "y": 1 },
+      "id": 3,
+      "title": "Execution Completion Rate by Status",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(conversation_executions_total[1m])) by (status)",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 },
+      "id": 4,
+      "title": "Agent Runtime Latency & Concurrency Guards",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 8 },
+      "id": 5,
+      "title": "Execution Runtime Duration (p50, p90, p99)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(conversation_execution_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50 duration"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(conversation_execution_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p90 duration"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(conversation_execution_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99 duration"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
+      "id": 6,
+      "title": "Retries, Quarantines & Zombie Fencing Rejections",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(conversation_retries_total[1m])) by (operation)",
+          "legendFormat": "retries: {{operation}}"
+        },
+        {
+          "expr": "sum(rate(quarantine_events_total[1m])) by (reason)",
+          "legendFormat": "quarantine: {{reason}}"
+        },
+        {
+          "expr": "sum(rate(zombie_fencing_rejections_total[1m])) by (reason)",
+          "legendFormat": "fencing: {{reason}}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["conversation-engine", "worker", "execution", "agent-runtime"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["5s", "10s", "30s", "1m"] },
+  "timezone": "browser",
+  "title": "Conversation Engine - Worker & Execution",
+  "uid": "ce-worker",
+  "version": 1
+}
