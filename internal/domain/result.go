@@ -12,11 +12,12 @@ const (
 	ExecutionStatusRunning   ExecutionStatus = "RUNNING"
 	ExecutionStatusSucceeded ExecutionStatus = "SUCCEEDED"
 	ExecutionStatusFailed    ExecutionStatus = "FAILED"
+	ExecutionStatusCancelled ExecutionStatus = "CANCELLED"
 )
 
 func (s ExecutionStatus) IsValid() bool {
 	switch s {
-	case ExecutionStatusPending, ExecutionStatusRunning, ExecutionStatusSucceeded, ExecutionStatusFailed:
+	case ExecutionStatusPending, ExecutionStatusRunning, ExecutionStatusSucceeded, ExecutionStatusFailed, ExecutionStatusCancelled:
 		return true
 	default:
 		return false
