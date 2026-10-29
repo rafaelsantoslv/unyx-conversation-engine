@@ -30,6 +30,7 @@ type ResultsRepository interface {
 	RecordExecutionStart(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error)
 	RecordExecutionSuccess(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, executionTime time.Duration) error
 	RecordExecutionSuccessWithFencing(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, executionTime time.Duration, fencingToken int64) error
+	RecordExecutionSuccessWithApplicability(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, executionTime time.Duration, fencingToken int64, expectedVersion int64) (*domain.ApplicabilityCheckResult, error)
 	RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration) error
 	RecordExecutionFailureWithFencing(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration, fencingToken int64) error
 	ScheduleRetry(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, baseBackoff, maxBackoff time.Duration) (bool, time.Time, error)
@@ -416,19 +417,25 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		log.Printf("[pipeline] agent runtime responded successfully for seq %d: tokens=%d, reply_preview=%.40s...",
 			seqNumber, out.TokensUsed, out.ResponseContent)
 
-		// 5. Salva resultado de sucesso de forma durável no PostgreSQL validando Fencing Token (INV-04)
+		// 5. Salva resultado de forma durável validando Fencing Token (INV-04) e Validação Atômica de Aplicabilidade (INV-06, INV-07)
 		if h.resultsRepo != nil {
 			var token int64
 			if activeExec != nil {
 				token = activeExec.FencingToken
 			}
-			if err := h.resultsRepo.RecordExecutionSuccessWithFencing(context.Background(), tenantID, convID, msgID, out, execDuration, token); err != nil {
+			appResult, err := h.resultsRepo.RecordExecutionSuccessWithApplicability(context.Background(), tenantID, convID, msgID, out, execDuration, token, 0)
+			if err != nil {
 				if errors.Is(err, domain.ErrFencingTokenStale) {
 					log.Printf("[pipeline] write rejected by fencing token %d: zombie worker write prevented (INV-04)", token)
 					return domain.ErrFencingTokenStale
 				}
 				log.Printf("[pipeline] error saving execution success to db: %v", err)
 				return fmt.Errorf("failed to record execution success in database: %w", err)
+			}
+
+			if appResult != nil && !appResult.IsApplicable {
+				log.Printf("[pipeline] WARN: result superseded and discarded (INV-06, INV-07)! Reason: %s (msg=%s, conv=%s, final_status=%s)",
+					appResult.Reason, msgID, convID, appResult.FinalStatus)
 			}
 		}
 	}

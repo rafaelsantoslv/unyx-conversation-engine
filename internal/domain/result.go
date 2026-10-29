@@ -8,16 +8,17 @@ import (
 type ExecutionStatus string
 
 const (
-	ExecutionStatusPending   ExecutionStatus = "PENDING"
-	ExecutionStatusRunning   ExecutionStatus = "RUNNING"
-	ExecutionStatusSucceeded ExecutionStatus = "SUCCEEDED"
-	ExecutionStatusFailed    ExecutionStatus = "FAILED"
-	ExecutionStatusCancelled ExecutionStatus = "CANCELLED"
+	ExecutionStatusPending         ExecutionStatus = "PENDING"
+	ExecutionStatusRunning         ExecutionStatus = "RUNNING"
+	ExecutionStatusSucceeded       ExecutionStatus = "SUCCEEDED"
+	ExecutionStatusFailed          ExecutionStatus = "FAILED"
+	ExecutionStatusCancelled       ExecutionStatus = "CANCELLED"
+	ExecutionStatusDiscardedStale  ExecutionStatus = "DISCARDED_STALE"
 )
 
 func (s ExecutionStatus) IsValid() bool {
 	switch s {
-	case ExecutionStatusPending, ExecutionStatusRunning, ExecutionStatusSucceeded, ExecutionStatusFailed, ExecutionStatusCancelled:
+	case ExecutionStatusPending, ExecutionStatusRunning, ExecutionStatusSucceeded, ExecutionStatusFailed, ExecutionStatusCancelled, ExecutionStatusDiscardedStale:
 		return true
 	default:
 		return false

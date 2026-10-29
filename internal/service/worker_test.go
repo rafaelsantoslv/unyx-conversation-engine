@@ -146,21 +146,29 @@ func (m *mockResultsRepo) RecordExecutionSuccess(ctx context.Context, tenantID, 
 }
 
 func (m *mockResultsRepo) RecordExecutionSuccessWithFencing(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, execTime time.Duration, fencingToken int64) error {
+	_, err := m.RecordExecutionSuccessWithApplicability(ctx, tenantID, conversationID, messageID, output, execTime, fencingToken, 0)
+	return err
+}
+
+func (m *mockResultsRepo) RecordExecutionSuccessWithApplicability(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, execTime time.Duration, fencingToken int64, expectedVersion int64) (*domain.ApplicabilityCheckResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.saveErr != nil {
-		return m.saveErr
+		return nil, m.saveErr
 	}
 	m.successCalls++
 	key := tenantID + ":" + conversationID + ":" + messageID
 	if res, ok := m.results[key]; ok {
 		if fencingToken > 0 && res.FencingToken != nil && *res.FencingToken > fencingToken {
-			return domain.ErrFencingTokenStale
+			return nil, domain.ErrFencingTokenStale
 		}
 		res.Status = domain.ExecutionStatusSucceeded
 		res.ExecutionTimeMS = execTime.Milliseconds()
 	}
-	return nil
+	return &domain.ApplicabilityCheckResult{
+		IsApplicable: true,
+		FinalStatus:  domain.ExecutionStatusSucceeded,
+	}, nil
 }
 
 func (m *mockResultsRepo) RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failErr error, execTime time.Duration) error {

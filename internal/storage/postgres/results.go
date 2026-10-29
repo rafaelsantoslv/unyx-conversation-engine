@@ -238,17 +238,106 @@ func (r *ResultsRepository) RecordExecutionSuccess(ctx context.Context, tenantID
 
 // RecordExecutionSuccessWithFencing persiste o sucesso validando atomicamente o fencing_token (INV-04).
 func (r *ResultsRepository) RecordExecutionSuccessWithFencing(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, executionTime time.Duration, fencingToken int64) error {
+	_, err := r.RecordExecutionSuccessWithApplicability(ctx, tenantID, conversationID, messageID, output, executionTime, fencingToken, 0)
+	return err
+}
+
+// RecordExecutionSuccessWithApplicability valida atômica e simultaneamente o fencing token, o estado da conversa ('AI_ACTIVE')
+// e a versão da conversa antes de registrar o resultado como SUCCEEDED e emitir a intenção de envio (Outbound Intent) na Outbox (INV-06, INV-07).
+// Se o estado migrou para 'HUMAN_ACTIVE' ou 'CLOSED', ou se a versão divergiu, o resultado é gravado como 'DISCARDED_STALE' e
+// NENHUM evento de envio é inserido na Outbox, protegendo operadores humanos de atropelos (INV-07).
+func (r *ResultsRepository) RecordExecutionSuccessWithApplicability(
+	ctx context.Context,
+	tenantID, conversationID, messageID string,
+	output interface{},
+	executionTime time.Duration,
+	fencingToken int64,
+	expectedVersion int64,
+) (*domain.ApplicabilityCheckResult, error) {
 	now := time.Now().UTC()
 	payloadBytes, err := json.Marshal(output)
 	if err != nil {
-		return fmt.Errorf("failed to marshal output payload: %w", err)
+		return nil, fmt.Errorf("failed to marshal output payload: %w", err)
 	}
 
-	var query string
-	var args []interface{}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
 
+	// 1. Checa atômica e diretamente no PostgreSQL o estado e a versão atual da conversa
+	var currentStateStr string
+	var currentVersion int64
+	checkConvQuery := `
+	SELECT status, version
+	FROM conversations
+	WHERE tenant_id = $1 AND id = $2;
+	`
+	err = tx.QueryRow(ctx, checkConvQuery, tenantID, conversationID).Scan(&currentStateStr, &currentVersion)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify conversation state: %w", err)
+	}
+	currentState := domain.ConversationState(currentStateStr)
+
+	// Validação de aplicabilidade: conversa precisa estar em AI_ACTIVE
+	// e, se expectedVersion > 0, a versão não pode ter divergido
+	isApplicable := true
+	discardReason := ""
+
+	if currentState != domain.StateAIActive {
+		isApplicable = false
+		discardReason = fmt.Sprintf("conversation state changed to %s during computation", currentState)
+	} else if expectedVersion > 0 && currentVersion != expectedVersion {
+		isApplicable = false
+		discardReason = fmt.Sprintf("conversation version mismatch (expected %d, got %d)", expectedVersion, currentVersion)
+	}
+
+	if !isApplicable {
+		// Grava como DISCARDED_STALE no processing_results
+		discardQuery := `
+		UPDATE processing_results
+		SET status = 'DISCARDED_STALE',
+		    output_payload = $1,
+		    execution_time_ms = $2,
+		    completed_at = $3,
+		    updated_at = $3,
+		    error_message = $4,
+		    last_error = $4,
+		    error_type = 'STALE_SUPERSEDED',
+		    lease_expires_at = NULL,
+		    next_retry_at = NULL
+		WHERE tenant_id = $5 AND conversation_id = $6 AND message_id = $7
+		  AND (fencing_token IS NULL OR $8 = 0 OR fencing_token <= $8);
+		`
+		cmdTag, err := tx.Exec(ctx, discardQuery, payloadBytes, executionTime.Milliseconds(), now, discardReason, tenantID, conversationID, messageID, fencingToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to record stale discarded result: %w", err)
+		}
+		if cmdTag.RowsAffected() == 0 && fencingToken > 0 {
+			return nil, domain.ErrFencingTokenStale
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("failed to commit discarded transaction: %w", err)
+		}
+
+		return &domain.ApplicabilityCheckResult{
+			IsApplicable:   false,
+			FinalStatus:    domain.ExecutionStatusDiscardedStale,
+			Reason:         discardReason,
+			CurrentState:   currentState,
+			CurrentVersion: currentVersion,
+		}, nil
+	}
+
+	// 2. Se for aplicável, atualiza o resultado para SUCCEEDED
+	var updateQuery string
+	var args []interface{}
 	if fencingToken > 0 {
-		query = `
+		updateQuery = `
 		UPDATE processing_results
 		SET status = 'SUCCEEDED', output_payload = $1, execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL, next_retry_at = NULL, error_message = NULL
 		WHERE tenant_id = $4 AND conversation_id = $5 AND message_id = $6
@@ -256,7 +345,7 @@ func (r *ResultsRepository) RecordExecutionSuccessWithFencing(ctx context.Contex
 		`
 		args = []interface{}{payloadBytes, executionTime.Milliseconds(), now, tenantID, conversationID, messageID, fencingToken}
 	} else {
-		query = `
+		updateQuery = `
 		UPDATE processing_results
 		SET status = 'SUCCEEDED', output_payload = $1, execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL, next_retry_at = NULL, error_message = NULL
 		WHERE tenant_id = $4 AND conversation_id = $5 AND message_id = $6;
@@ -264,18 +353,80 @@ func (r *ResultsRepository) RecordExecutionSuccessWithFencing(ctx context.Contex
 		args = []interface{}{payloadBytes, executionTime.Milliseconds(), now, tenantID, conversationID, messageID}
 	}
 
-	cmdTag, err := r.pool.Exec(ctx, query, args...)
+	cmdTag, err := tx.Exec(ctx, updateQuery, args...)
 	if err != nil {
-		return fmt.Errorf("failed to record execution success: %w", err)
+		return nil, fmt.Errorf("failed to record execution success: %w", err)
 	}
 	if cmdTag.RowsAffected() == 0 {
 		if fencingToken > 0 {
-			return domain.ErrFencingTokenStale
+			return nil, domain.ErrFencingTokenStale
 		}
-		return fmt.Errorf("processing result record not found for update: tenant=%s, conv=%s, msg=%s", tenantID, conversationID, messageID)
+		return nil, fmt.Errorf("processing result record not found for update: tenant=%s, conv=%s, msg=%s", tenantID, conversationID, messageID)
 	}
 
-	return nil
+	// 3. Emite o evento de intenção de envio (Outbound Intent) na mesma transação atômica
+	var outContent string
+	var tokensUsed int
+	if outObj, ok := output.(*domain.ExecutionOutput); ok && outObj != nil {
+		outContent = outObj.ResponseContent
+		tokensUsed = outObj.TokensUsed
+	} else if outObj, ok := output.(domain.ExecutionOutput); ok {
+		outContent = outObj.ResponseContent
+		tokensUsed = outObj.TokensUsed
+	}
+
+	outboundPayload := domain.Event[domain.OutboundIntentPayload]{
+		EventID:        uuid.New().String(),
+		TenantID:       tenantID,
+		ConversationID: conversationID,
+		EventType:      domain.EventTypeOutboundIntent,
+		Version:        domain.EventVersionV1,
+		OccurredAt:     now,
+		Payload: domain.OutboundIntentPayload{
+			MessageID:      messageID,
+			ConversationID: conversationID,
+			TenantID:       tenantID,
+			Content:        outContent,
+			GeneratedAt:    now,
+			TokensUsed:     tokensUsed,
+		},
+	}
+	outboundBytes, err := json.Marshal(outboundPayload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal outbound event payload: %w", err)
+	}
+
+	insertOutboxQuery := `
+	INSERT INTO outbox_events (
+		id, tenant_id, conversation_id, event_type, payload, partition_key, status, retry_count, created_at
+	) VALUES (
+		$1, $2, $3, $4, $5, $6, 'PENDING', 0, $7
+	);
+	`
+	outboxID := uuid.New().String()
+	_, err = tx.Exec(ctx, insertOutboxQuery,
+		outboxID,
+		tenantID,
+		conversationID,
+		domain.EventTypeOutboundIntent,
+		outboundBytes,
+		conversationID,
+		now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert outbound intent to outbox: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit execution success and outbound intent: %w", err)
+	}
+
+	return &domain.ApplicabilityCheckResult{
+		IsApplicable:   true,
+		FinalStatus:    domain.ExecutionStatusSucceeded,
+		CurrentState:   currentState,
+		CurrentVersion: currentVersion,
+	}, nil
 }
 
 // RecordExecutionFailure atualiza o resultado para FAILED salvando a mensagem de erro e liberando o lease.
