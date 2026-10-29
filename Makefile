@@ -23,6 +23,9 @@ test:
 test-e2e:
 	go test -v ./tests/e2e/...
 
+test-resilience:
+	go test -v ./tests/e2e/... -run TestResilience_EPIC03_Matrix
+
 run-api:
 	go run -buildvcs=false ./cmd/api
 
