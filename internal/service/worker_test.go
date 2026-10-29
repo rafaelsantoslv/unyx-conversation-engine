@@ -63,6 +63,7 @@ func (m *mockPipelineHandler) HandleMessageReceived(ctx context.Context, evt dom
 type mockResultsRepo struct {
 	mu           sync.Mutex
 	results      map[string]*domain.ProcessingResult
+	quarantined  []domain.QuarantinedEvent
 	startCalls   int
 	successCalls int
 	failureCalls int
@@ -228,6 +229,16 @@ func (m *mockResultsRepo) ScheduleRetry(ctx context.Context, tenantID, conversat
 	return false, time.Time{}, nil
 }
 
+func (m *mockResultsRepo) QuarantineEvent(ctx context.Context, qEvent domain.QuarantinedEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	m.quarantined = append(m.quarantined, qEvent)
+	return nil
+}
+
 type mockAgentRuntime struct {
 	mu     sync.Mutex
 	output *domain.ExecutionOutput
@@ -305,19 +316,20 @@ func TestConversationWorkerService(t *testing.T) {
 		}
 	})
 
-	t.Run("corrupted JSON is logged and committed to avoid poison pill deadlock", func(t *testing.T) {
+	t.Run("corrupted JSON is logged, quarantined and committed to avoid poison pill deadlock", func(t *testing.T) {
+		resultsRepo := newMockResultsRepo()
 		consumer := &mockKafkaConsumer{
 			messages: []kafka.Message{
 				{
 					Topic:  "conversation.events",
-					Key:    []byte("corrupted-key"),
+					Key:    []byte("tenant-test:conv-test"),
 					Value:  []byte("{not-a-valid-json"),
 					Offset: 11,
 				},
 			},
 		}
 		handler := &mockPipelineHandler{}
-		worker := service.NewConversationWorkerService(consumer, handler)
+		worker := service.NewConversationWorkerService(consumer, handler, service.WithWorkerResultsRepo(resultsRepo))
 
 		err := worker.ProcessNextMessage(ctx)
 		if err != nil {
@@ -332,6 +344,12 @@ func TestConversationWorkerService(t *testing.T) {
 		}
 		if consumer.committed[0].Offset != 11 {
 			t.Errorf("expected committed offset 11, got %d", consumer.committed[0].Offset)
+		}
+		if len(resultsRepo.quarantined) != 1 {
+			t.Fatalf("expected 1 event in quarantine, got %d", len(resultsRepo.quarantined))
+		}
+		if resultsRepo.quarantined[0].TenantID != "tenant-test" {
+			t.Errorf("expected tenant-test, got %s", resultsRepo.quarantined[0].TenantID)
 		}
 	})
 
@@ -578,6 +596,53 @@ func TestDefaultMessagePipelineHandler_OrderingAndIdempotency(t *testing.T) {
 		}
 		if res.ErrorType == nil || *res.ErrorType != "TRANS" {
 			t.Errorf("expected ErrorType TRANS, got %v", res.ErrorType)
+		}
+	})
+
+	t.Run("isolates permanent failure to quarantine (Dead Letter) without retrying (INV-06)", func(t *testing.T) {
+		resultsRepo := newMockResultsRepo()
+		runtime := &mockAgentRuntime{
+			err: errors.New("400 Bad Request: unrecoverable prompt"),
+		}
+		pipeline := service.NewDefaultMessagePipelineHandler(runtime, resultsRepo)
+
+		evt := domain.Event[domain.MessageReceivedPayload]{
+			EventID:        "evt-perm-1",
+			TenantID:       "tenant-perm",
+			ConversationID: "conv-perm",
+			EventType:      domain.EventTypeMessageReceived,
+			OccurredAt:     time.Now(),
+			Payload: domain.MessageReceivedPayload{
+				MessageID:      "msg-perm-1",
+				SequenceNumber: 1,
+				Content:        "Tentativa com erro permanente",
+				Role:           domain.RoleUser,
+			},
+		}
+
+		err := pipeline.HandleMessageReceived(ctx, evt)
+		if err == nil {
+			t.Fatalf("expected error from handler for permanent failure")
+		}
+
+		key := "tenant-perm:conv-perm:msg-perm-1"
+		res := resultsRepo.results[key]
+		if res == nil {
+			t.Fatalf("expected processing result to be recorded")
+		}
+		if res.Status != domain.ExecutionStatusFailed {
+			t.Errorf("expected status FAILED, got %s", res.Status)
+		}
+
+		if len(resultsRepo.quarantined) != 1 {
+			t.Fatalf("expected 1 event quarantined, got %d", len(resultsRepo.quarantined))
+		}
+		q := resultsRepo.quarantined[0]
+		if q.EventID != "evt-perm-1" {
+			t.Errorf("expected event_id evt-perm-1 in quarantine, got %s", q.EventID)
+		}
+		if q.TenantID != "tenant-perm" {
+			t.Errorf("expected tenant_id tenant-perm in quarantine, got %s", q.TenantID)
 		}
 	})
 }

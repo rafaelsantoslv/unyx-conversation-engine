@@ -394,3 +394,82 @@ func (r *ResultsRepository) ScheduleRetry(ctx context.Context, tenantID, convers
 
 	return false, time.Time{}, nil
 }
+
+// QuarantineEvent isola duravelmente um evento na tabela quarantine_events (Dead Letter),
+// preservando o payload sanitizado e a causa raiz do erro (INV-06, INV-08).
+func (r *ResultsRepository) QuarantineEvent(ctx context.Context, qEvent domain.QuarantinedEvent) error {
+	if qEvent.ID == "" {
+		qEvent.ID = uuid.New().String()
+	}
+	if qEvent.QuarantinedAt.IsZero() {
+		qEvent.QuarantinedAt = time.Now().UTC()
+	}
+	if len(qEvent.Payload) == 0 {
+		qEvent.Payload = json.RawMessage(`{}`)
+	} else if !json.Valid(qEvent.Payload) {
+		// Se o payload for texto corrompido que não é JSON válido, encapsula com segurança como string JSON
+		escaped, _ := json.Marshal(string(qEvent.Payload))
+		qEvent.Payload = json.RawMessage(fmt.Sprintf(`{"raw_malformed_payload": %s}`, escaped))
+	}
+
+	query := `
+	INSERT INTO quarantine_events (
+		id, tenant_id, conversation_id, event_id, payload, error_reason, stack_trace, attempt_count, quarantined_at
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+	`
+
+	_, err := r.pool.Exec(
+		ctx,
+		query,
+		qEvent.ID,
+		qEvent.TenantID,
+		qEvent.ConversationID,
+		qEvent.EventID,
+		qEvent.Payload,
+		qEvent.ErrorReason,
+		qEvent.StackTrace,
+		qEvent.AttemptCount,
+		qEvent.QuarantinedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert quarantine event: %w", err)
+	}
+
+	return nil
+}
+
+// GetQuarantinedEvent recupera um evento da quarentena pelo event_id e tenant_id.
+func (r *ResultsRepository) GetQuarantinedEvent(ctx context.Context, tenantID, eventID string) (*domain.QuarantinedEvent, error) {
+	query := `
+	SELECT id, tenant_id, conversation_id, event_id, payload, error_reason, stack_trace, attempt_count, quarantined_at, resolved_at
+	FROM quarantine_events
+	WHERE tenant_id = $1 AND event_id = $2;
+	`
+
+	var q domain.QuarantinedEvent
+	var stackTrace *string
+	err := r.pool.QueryRow(ctx, query, tenantID, eventID).Scan(
+		&q.ID,
+		&q.TenantID,
+		&q.ConversationID,
+		&q.EventID,
+		&q.Payload,
+		&q.ErrorReason,
+		&stackTrace,
+		&q.AttemptCount,
+		&q.QuarantinedAt,
+		&q.ResolvedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get quarantined event: %w", err)
+	}
+
+	if stackTrace != nil {
+		q.StackTrace = *stackTrace
+	}
+
+	return &q, nil
+}

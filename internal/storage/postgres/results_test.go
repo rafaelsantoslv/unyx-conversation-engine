@@ -362,4 +362,41 @@ func TestResultsRepository_ScheduleRetry_Integration(t *testing.T) {
 			t.Errorf("expected PERMANENT error type, got %v", res.ErrorType)
 		}
 	})
+
+	t.Run("quarantines poison pill event into quarantine_events table (INV-06, INV-08)", func(t *testing.T) {
+		qEventID := fmt.Sprintf("evt-q-%d", time.Now().UnixNano())
+		qEvent := domain.QuarantinedEvent{
+			ID:             uuid.New().String(),
+			TenantID:       tenantID,
+			ConversationID: conv.ID,
+			EventID:        qEventID,
+			Payload:        []byte(`{"corrupted":"payload"}`),
+			ErrorReason:    "corrupted json payload: syntax error",
+			StackTrace:     "goroutine 1 [running]:...",
+			AttemptCount:   1,
+			QuarantinedAt:  time.Now().UTC(),
+		}
+
+		err := resultsRepo.QuarantineEvent(ctx, qEvent)
+		if err != nil {
+			t.Fatalf("QuarantineEvent failed: %v", err)
+		}
+
+		saved, err := resultsRepo.GetQuarantinedEvent(ctx, tenantID, qEventID)
+		if err != nil {
+			t.Fatalf("GetQuarantinedEvent failed: %v", err)
+		}
+		if saved == nil {
+			t.Fatalf("expected quarantined event to be found in database")
+		}
+		if saved.EventID != qEventID {
+			t.Errorf("expected event_id %s, got %s", qEventID, saved.EventID)
+		}
+		if saved.ErrorReason != "corrupted json payload: syntax error" {
+			t.Errorf("expected error reason to match, got %s", saved.ErrorReason)
+		}
+		if string(saved.Payload) != `{"corrupted": "payload"}` && string(saved.Payload) != `{"corrupted":"payload"}` {
+			t.Errorf("expected payload to match, got %s", string(saved.Payload))
+		}
+	})
 }

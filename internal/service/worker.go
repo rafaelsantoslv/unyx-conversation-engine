@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/domain"
@@ -32,6 +33,7 @@ type ResultsRepository interface {
 	RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration) error
 	RecordExecutionFailureWithFencing(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration, fencingToken int64) error
 	ScheduleRetry(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, baseBackoff, maxBackoff time.Duration) (bool, time.Time, error)
+	QuarantineEvent(ctx context.Context, qEvent domain.QuarantinedEvent) error
 }
 
 // ConversationCoordinator define o contrato para coordenação distribuída entre múltiplos workers (INV-02, INV-04, INV-08).
@@ -263,6 +265,27 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 				} else {
 					log.Printf("[pipeline] permanent failure recorded (no retry): conv=%s, msg=%s, err=%v",
 						convID, msgID, err)
+
+					// Isola na Quarentena (Dead Letter) para erros permanentes ou retries estourados (INV-06)
+					evtBytes, _ := json.Marshal(evt)
+					attempt := 1
+					if res, _ := h.resultsRepo.GetResult(context.Background(), tenantID, convID, msgID); res != nil {
+						attempt = res.AttemptCount
+					}
+					qErr := h.resultsRepo.QuarantineEvent(context.Background(), domain.QuarantinedEvent{
+						TenantID:       tenantID,
+						ConversationID: convID,
+						EventID:        evt.EventID,
+						Payload:        evtBytes,
+						ErrorReason:    err.Error(),
+						AttemptCount:   attempt,
+						QuarantinedAt:  time.Now().UTC(),
+					})
+					if qErr != nil {
+						log.Printf("[pipeline] warning: failed to isolate permanent failure into quarantine: %v", qErr)
+					} else {
+						log.Printf("[pipeline] event %s successfully quarantined (dead letter isolation)", evt.EventID)
+					}
 				}
 			}
 			return fmt.Errorf("agent runtime execution error: %w", err)
@@ -293,19 +316,34 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 
 // ConversationWorkerService orquestra o consumo de eventos, desserialização, validação, execução e commit manual.
 type ConversationWorkerService struct {
-	consumer transkafka.Consumer
-	handler  MessagePipelineHandler
+	consumer    transkafka.Consumer
+	handler     MessagePipelineHandler
+	resultsRepo ResultsRepository
+}
+
+// WorkerServiceOption configura o ConversationWorkerService.
+type WorkerServiceOption func(*ConversationWorkerService)
+
+// WithWorkerResultsRepo injeta o ResultsRepository para quarentena de poison pills no worker.
+func WithWorkerResultsRepo(repo ResultsRepository) WorkerServiceOption {
+	return func(w *ConversationWorkerService) {
+		w.resultsRepo = repo
+	}
 }
 
 // NewConversationWorkerService inicializa o serviço de processamento do worker.
-func NewConversationWorkerService(consumer transkafka.Consumer, handler MessagePipelineHandler) *ConversationWorkerService {
+func NewConversationWorkerService(consumer transkafka.Consumer, handler MessagePipelineHandler, opts ...WorkerServiceOption) *ConversationWorkerService {
 	if handler == nil {
 		handler = &DefaultMessagePipelineHandler{}
 	}
-	return &ConversationWorkerService{
+	w := &ConversationWorkerService{
 		consumer: consumer,
 		handler:  handler,
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	return w
 }
 
 // ProcessNextMessage busca a próxima mensagem no Kafka, valida e processa com commit manual.
@@ -328,6 +366,32 @@ func (w *ConversationWorkerService) handleMessage(ctx context.Context, msg kafka
 		log.Printf("ERROR: corrupted json payload in message (topic=%s, partition=%d, offset=%d, key=%s): %v. Payload: %s",
 			msg.Topic, msg.Partition, msg.Offset, string(msg.Key), err, string(msg.Value))
 
+		// Isola Poison Pill de JSON corrompido em quarantine_events antes de commitar
+		if w.resultsRepo != nil {
+			tenantID := "unknown"
+			keyParts := strings.Split(string(msg.Key), ":")
+			if len(keyParts) > 0 && keyParts[0] != "" {
+				tenantID = keyParts[0]
+			}
+			convID := "unknown"
+			if len(keyParts) > 1 && keyParts[1] != "" {
+				convID = keyParts[1]
+			}
+
+			qErr := w.resultsRepo.QuarantineEvent(ctx, domain.QuarantinedEvent{
+				TenantID:       tenantID,
+				ConversationID: convID,
+				EventID:        fmt.Sprintf("poison-offset-%d-%d", msg.Partition, msg.Offset),
+				Payload:        msg.Value,
+				ErrorReason:    fmt.Sprintf("corrupted json payload: %v", err),
+				AttemptCount:   1,
+				QuarantinedAt:  time.Now().UTC(),
+			})
+			if qErr != nil {
+				log.Printf("failed to isolate corrupted json into quarantine: %v", qErr)
+			}
+		}
+
 		if commitErr := w.consumer.CommitMessages(ctx, msg); commitErr != nil {
 			log.Printf("failed to commit corrupted message: %v", commitErr)
 			return commitErr
@@ -337,6 +401,23 @@ func (w *ConversationWorkerService) handleMessage(ctx context.Context, msg kafka
 
 	if err := evt.Validate(); err != nil {
 		log.Printf("WARN: schema validation failed for event_id=%s, skipping: %v", evt.EventID, err)
+
+		// Isola Poison Pill de validação de schema em quarantine_events antes de commitar
+		if w.resultsRepo != nil {
+			qErr := w.resultsRepo.QuarantineEvent(ctx, domain.QuarantinedEvent{
+				TenantID:       evt.TenantID,
+				ConversationID: evt.ConversationID,
+				EventID:        evt.EventID,
+				Payload:        msg.Value,
+				ErrorReason:    fmt.Sprintf("schema validation failed: %v", err),
+				AttemptCount:   1,
+				QuarantinedAt:  time.Now().UTC(),
+			})
+			if qErr != nil {
+				log.Printf("failed to isolate invalid schema event into quarantine: %v", qErr)
+			}
+		}
+
 		if commitErr := w.consumer.CommitMessages(ctx, msg); commitErr != nil {
 			log.Printf("failed to commit invalid message: %v", commitErr)
 			return commitErr
@@ -347,6 +428,21 @@ func (w *ConversationWorkerService) handleMessage(ctx context.Context, msg kafka
 	// Processa a mensagem pelo pipeline (idempotência, ordenação sequencial estrita e coordenação distribuída)
 	if err := w.handler.HandleMessageReceived(ctx, evt); err != nil {
 		log.Printf("pipeline handling failed for event_id=%s: %v", evt.EventID, err)
+
+		// Se o erro foi permanente ou os retries se esgotaram (status = FAILED),
+		// o evento foi isolado na quarentena e podemos commitar o offset para destravar a partição!
+		if w.resultsRepo != nil {
+			res, getErr := w.resultsRepo.GetResult(ctx, evt.TenantID, evt.ConversationID, evt.Payload.MessageID)
+			if getErr == nil && res != nil && res.Status == domain.ExecutionStatusFailed {
+				log.Printf("[worker] event %s failed permanently and quarantined. Committing offset to unblock partition (INV-06).", evt.EventID)
+				if commitErr := w.consumer.CommitMessages(ctx, msg); commitErr != nil {
+					log.Printf("failed to commit quarantined message offset: %v", commitErr)
+					return commitErr
+				}
+				return nil
+			}
+		}
+
 		return err
 	}
 

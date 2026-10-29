@@ -680,3 +680,138 @@ func TestConversationWorker_RetryTransientFailure_Integration(t *testing.T) {
 		t.Errorf("expected exactly 3 attempts executed on runtime, got %d", flappyRuntime.attemptsDone)
 	}
 }
+
+func TestConversationWorker_PoisonPillQuarantine_Integration(t *testing.T) {
+	brokersEnv := os.Getenv("KAFKA_BROKERS")
+	if brokersEnv == "" {
+		brokersEnv = "localhost:9092"
+	}
+	brokers := strings.Split(brokersEnv, ",")
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://postgres:postgres@localhost:5432/unyx_conversation?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	dbPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Skipf("skipping integration test: postgres connection failed: %v", err)
+		return
+	}
+	defer dbPool.Close()
+
+	if err := dbPool.Ping(ctx); err != nil {
+		t.Skipf("skipping integration test: postgres ping failed: %v", err)
+		return
+	}
+
+	repo := postgres.NewRepository(dbPool)
+	resultsRepo := postgres.NewResultsRepository(dbPool)
+
+	tenantID := fmt.Sprintf("tenant-poison-%d", time.Now().UnixNano())
+	extConvID := fmt.Sprintf("conv-poison-%d", time.Now().UnixNano())
+	conv, err := repo.GetOrCreateConversation(ctx, tenantID, extConvID)
+	if err != nil {
+		t.Fatalf("failed to create conversation: %v", err)
+	}
+
+	topic := fmt.Sprintf("test.poison.quarantine.%d", time.Now().UnixNano())
+	conn, err := kafka.Dial("tcp", brokers[0])
+	if err != nil {
+		t.Skipf("skipping test: kafka dial failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	_ = conn.CreateTopics(kafka.TopicConfig{
+		Topic:             topic,
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	})
+
+	publisher := transkafka.NewKafkaPublisher(brokers)
+	defer publisher.Close()
+
+	// 1. Publica mensagem 1: Poison Pill (JSON corrompido)
+	corruptedValue := []byte("{invalid-json-poison-pill")
+	err = publisher.Publish(ctx, topic, tenantID+":"+conv.ID, corruptedValue)
+	if err != nil {
+		t.Fatalf("failed to publish corrupted message: %v", err)
+	}
+
+	// 2. Publica mensagem 2: Mensagem saudável subsequente
+	healthyMsgID := uuid.New().String()
+	healthyEvt := domain.Event[domain.MessageReceivedPayload]{
+		EventID:        fmt.Sprintf("evt-healthy-%d", time.Now().UnixNano()),
+		TenantID:       tenantID,
+		ConversationID: conv.ID,
+		EventType:      domain.EventTypeMessageReceived,
+		Version:        domain.EventVersionV1,
+		OccurredAt:     time.Now().UTC(),
+		Payload: domain.MessageReceivedPayload{
+			MessageID:         healthyMsgID,
+			ExternalMessageID: fmt.Sprintf("ext-healthy-%d", time.Now().UnixNano()),
+			Channel:           "whatsapp",
+			Role:              domain.RoleUser,
+			Content:           "Mensagem saudável que deve processar após a quarentena",
+			SequenceNumber:    1,
+		},
+	}
+	healthyBytes, _ := json.Marshal(healthyEvt)
+	err = publisher.Publish(ctx, topic, tenantID+":"+conv.ID, healthyBytes)
+	if err != nil {
+		t.Fatalf("failed to publish healthy message: %v", err)
+	}
+
+	// 3. Inicializa Worker configurado com quarentena
+	mockRuntime := mock.NewMockRuntime(mock.WithSimulatedReply("Processada com sucesso!"))
+	pipeline := service.NewDefaultMessagePipelineHandler(mockRuntime, resultsRepo)
+
+	consumer := transkafka.NewKafkaConsumer(transkafka.ConsumerConfig{
+		Brokers: brokers,
+		Topic:   topic,
+		GroupID: fmt.Sprintf("group-poison-%d", time.Now().UnixNano()),
+		MaxWait: 200 * time.Millisecond,
+	})
+	defer consumer.Close()
+
+	worker := service.NewConversationWorkerService(
+		consumer,
+		pipeline,
+		service.WithWorkerResultsRepo(resultsRepo),
+	)
+
+	// 4. Executa 1ª iteração: deve consumir a poison pill, isolar na quarentena e commitar offset (destravando a partição)
+	err = worker.ProcessNextMessage(ctx)
+	if err != nil {
+		t.Fatalf("worker failed on poison pill processing: %v", err)
+	}
+
+	// 5. Executa 2ª iteração: deve consumir a mensagem saudável normalmente
+	err = worker.ProcessNextMessage(ctx)
+	if err != nil {
+		t.Fatalf("worker failed on healthy message processing: %v", err)
+	}
+
+	// 6. Valida que o evento saudável foi concluído com SUCCEEDED
+	healthyRes, err := resultsRepo.GetResult(ctx, tenantID, conv.ID, healthyMsgID)
+	if err != nil {
+		t.Fatalf("failed to get healthy result: %v", err)
+	}
+	if healthyRes == nil || healthyRes.Status != domain.ExecutionStatusSucceeded {
+		t.Errorf("expected healthy message to succeed, got %+v", healthyRes)
+	}
+
+	// 7. Valida que a quarentena possui o registro do evento venenoso
+	var count int
+	err = dbPool.QueryRow(ctx, "SELECT COUNT(*) FROM quarantine_events WHERE tenant_id = $1", tenantID).Scan(&count)
+	if err != nil {
+		t.Fatalf("failed to count quarantine events: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 quarantined event in db, got %d", count)
+	}
+}
