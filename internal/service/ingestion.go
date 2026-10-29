@@ -68,7 +68,7 @@ func (s *IngestionService) IngestMessage(ctx context.Context, req dto.IngestMess
 		ConversationID: conv.ID,
 		EventType:      domain.EventTypeMessageReceived,
 		Payload:        payloadBytes,
-		PartitionKey:   conv.ID,
+		PartitionKey:   fmt.Sprintf("%s:%s", req.TenantID, conv.ID),
 		Status:         domain.OutboxStatusPending,
 		CreatedAt:      msg.CreatedAt,
 	}

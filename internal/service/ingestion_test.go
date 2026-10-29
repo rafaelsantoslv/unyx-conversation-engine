@@ -66,8 +66,9 @@ func TestIngestionService_IngestMessage(t *testing.T) {
 		if repo.saved.ConversationID != conv.ID {
 			t.Errorf("expected conversation_id %s, got %s", conv.ID, repo.saved.ConversationID)
 		}
-		if repo.outbox.PartitionKey != conv.ID {
-			t.Errorf("expected partition key %s, got %s", conv.ID, repo.outbox.PartitionKey)
+		expectedKey := conv.TenantID + ":" + conv.ID
+		if repo.outbox.PartitionKey != expectedKey {
+			t.Errorf("expected partition key %s, got %s", expectedKey, repo.outbox.PartitionKey)
 		}
 		if repo.outbox.Status != domain.OutboxStatusPending {
 			t.Errorf("expected status PENDING, got %s", repo.outbox.Status)
