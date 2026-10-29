@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/domain"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/integration/chatwoot"
 	cwDto "github.com/rafaelsantoslv/unyx-conversation-engine/internal/integration/chatwoot/dto"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/integration/ports"
@@ -25,10 +26,15 @@ type WebhookMessageClassifier interface {
 	ClassifyMessage(ctx context.Context, tenantID string, payload *cwDto.ChatwootWebhookPayload) (chatwoot.MessageClassification, string)
 }
 
+type WebhookStateSynchronizer interface {
+	SyncChatwootEvent(ctx context.Context, tenantID string, payload *cwDto.ChatwootWebhookPayload) (*domain.Conversation, error)
+}
+
 type ChatwootWebhookHandler struct {
 	ingestionSvc  IngestionService
 	authValidator WebhookAuthValidator
 	classifier    WebhookMessageClassifier
+	stateSync     WebhookStateSynchronizer
 }
 
 func NewChatwootWebhookHandler(ingestionSvc IngestionService, authValidator WebhookAuthValidator, opts ...WebhookOption) *ChatwootWebhookHandler {
@@ -48,6 +54,12 @@ type WebhookOption func(*ChatwootWebhookHandler)
 func WithMessageClassifier(classifier WebhookMessageClassifier) WebhookOption {
 	return func(h *ChatwootWebhookHandler) {
 		h.classifier = classifier
+	}
+}
+
+func WithStateSynchronizer(stateSync WebhookStateSynchronizer) WebhookOption {
+	return func(h *ChatwootWebhookHandler) {
+		h.stateSync = stateSync
 	}
 }
 
@@ -131,7 +143,14 @@ func (h *ChatwootWebhookHandler) HandleWebhook(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// 4. Normalização e Anti-Corruption Layer (ACL)
+	// 4. Sincronização Reativa de Estado da Conversa (INV-05, INV-06)
+	if h.stateSync != nil {
+		if _, syncErr := h.stateSync.SyncChatwootEvent(r.Context(), tenantID, &cwPayload); syncErr != nil {
+			log.Printf("[webhook] warning: state synchronization error for tenant %s: %v", tenantID, syncErr)
+		}
+	}
+
+	// 5. Normalização e Anti-Corruption Layer (ACL)
 	canonicalEvt, err := cwPayload.ToCanonicalProviderEvent(tenantID)
 	if err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, "mapping error", err.Error(), reqID)
@@ -142,11 +161,11 @@ func (h *ChatwootWebhookHandler) HandleWebhook(w http.ResponseWriter, r *http.Re
 		log.Printf("[webhook] ignored non-actionable chatwoot event: type=%s, event=%s", canonicalEvt.Type, cwPayload.Event)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ignored","reason":"non_actionable_event"}`))
+		_, _ = w.Write([]byte(`{"status":"ok","reason":"event_processed_or_state_synced"}`))
 		return
 	}
 
-	// 5. Ingestão assíncrona no IngestionService com Transactional Outbox (INV-02)
+	// 6. Ingestão assíncrona no IngestionService com Transactional Outbox (INV-02)
 	ingestReq := dto.IngestMessageRequest{
 		TenantID:          canonicalEvt.TenantID,
 		ConversationID:    canonicalEvt.IncomingMessage.ExternalConversationID,
