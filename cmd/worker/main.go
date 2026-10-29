@@ -40,6 +40,8 @@ func main() {
 	}
 
 	resultsRepo := postgres.NewResultsRepository(dbPool)
+	coordinator := postgres.NewExecutionCoordinator(dbPool)
+	workerID := fmt.Sprintf("worker-%d", os.Getpid())
 
 	// 2. Inicializa Kafka Consumer com Consumer Group "conversation-engine-workers"
 	consumerCfg := transkafka.ConsumerConfig{
@@ -63,7 +65,11 @@ func main() {
 		mock.WithLatency(150 * time.Millisecond), // Simula tempo de raciocínio da IA
 		mock.WithSimulatedReply("Olá! Sou o assistente virtual Unyx. Como posso ajudar você hoje?"),
 	)
-	pipelineHandler := service.NewDefaultMessagePipelineHandler(mockRuntime, resultsRepo)
+	pipelineHandler := service.NewDefaultMessagePipelineHandler(
+		mockRuntime,
+		resultsRepo,
+		service.WithCoordinator(coordinator, workerID),
+	)
 	workerService := service.NewConversationWorkerService(kafkaConsumer, pipelineHandler)
 
 	// 4. Servidor HTTP de Health Check e Liveness

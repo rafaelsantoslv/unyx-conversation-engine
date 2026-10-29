@@ -434,3 +434,98 @@ func TestConversationWorker_StrictOrdering_Integration(t *testing.T) {
 		}
 	}
 }
+
+
+func TestConversationWorker_DistributedCoordination_Integration(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://postgres:postgres@localhost:5432/unyx_conversation?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dbPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Skipf("skipping integration test: postgres connection failed: %v", err)
+		return
+	}
+	defer dbPool.Close()
+
+	repo := postgres.NewRepository(dbPool)
+	resultsRepo := postgres.NewResultsRepository(dbPool)
+	coordinator := postgres.NewExecutionCoordinator(dbPool)
+
+	tenantID := fmt.Sprintf("tenant-dist-%d", time.Now().UnixNano())
+	conv, err := repo.GetOrCreateConversation(ctx, tenantID, "conv-dist-1")
+	if err != nil {
+		t.Fatalf("failed to create conversation: %v", err)
+	}
+
+	mockRuntime := mock.NewMockRuntime(
+		mock.WithLatency(40*time.Millisecond),
+		mock.WithSimulatedReply("Resposta distribuída com sucesso"),
+	)
+
+	// Cria dois pipelines representando dois workers distintos
+	pipeline1 := service.NewDefaultMessagePipelineHandler(
+		mockRuntime,
+		resultsRepo,
+		service.WithCoordinator(coordinator, "worker-node-1"),
+	)
+
+	pipeline2 := service.NewDefaultMessagePipelineHandler(
+		mockRuntime,
+		resultsRepo,
+		service.WithCoordinator(coordinator, "worker-node-2"),
+	)
+
+	msgID := uuid.New().String()
+	evt := domain.Event[domain.MessageReceivedPayload]{
+		EventID:        "evt-dist-1",
+		TenantID:       tenantID,
+		ConversationID: conv.ID,
+		EventType:      domain.EventTypeMessageReceived,
+		OccurredAt:     time.Now().UTC(),
+		Payload: domain.MessageReceivedPayload{
+			MessageID:         msgID,
+			ExternalMessageID: "ext-dist-1",
+			Channel:           "whatsapp",
+			Role:              domain.RoleUser,
+			Content:           "Pergunta disputada entre 2 workers",
+			SequenceNumber:    1,
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var err1, err2 error
+
+	go func() {
+		defer wg.Done()
+		err1 = pipeline1.HandleMessageReceived(ctx, evt)
+	}()
+
+	go func() {
+		defer wg.Done()
+		err2 = pipeline2.HandleMessageReceived(ctx, evt)
+	}()
+
+	wg.Wait()
+
+	if err1 != nil {
+		t.Errorf("pipeline 1 failed unexpectedly: %v", err1)
+	}
+	if err2 != nil {
+		t.Errorf("pipeline 2 failed unexpectedly: %v", err2)
+	}
+
+	// Verifica se o resultado em processing_results foi gravado como SUCCEEDED
+	res, err := resultsRepo.GetResult(ctx, tenantID, conv.ID, msgID)
+	if err != nil {
+		t.Fatalf("failed to get result: %v", err)
+	}
+	if res == nil || res.Status != domain.ExecutionStatusSucceeded {
+		t.Errorf("expected SUCCEEDED status in DB, got %+v", res)
+	}
+}

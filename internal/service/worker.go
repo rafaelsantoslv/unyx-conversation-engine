@@ -30,20 +30,45 @@ type ResultsRepository interface {
 	RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration) error
 }
 
-// DefaultMessagePipelineHandler é a implementação do pipeline que orquestra idempotência durável,
-// ordenação sequencial estrita por conversa (INV-02) e paralelismo entre conversas (INV-03).
+// ConversationCoordinator define o contrato para coordenação distribuída entre múltiplos workers (INV-02, INV-08).
+type ConversationCoordinator interface {
+	AcquireExecution(ctx context.Context, tenantID, conversationID, workerID string, leaseDuration time.Duration) (*domain.ConversationExecution, error)
+	ReleaseExecution(ctx context.Context, executionID string, finalStatus domain.ExecutionStatus) error
+}
+
+// DefaultMessagePipelineHandler é a implementação do pipeline que orquestra coordenação distribuída,
+// idempotência durável, ordenação sequencial estrita por conversa (INV-02) e paralelismo entre conversas (INV-03).
 type DefaultMessagePipelineHandler struct {
 	runtime     domain.AgentRuntime
 	resultsRepo ResultsRepository
+	coordinator ConversationCoordinator
+	workerID    string
 	leaseTime   time.Duration
 }
 
-// NewDefaultMessagePipelineHandler cria um novo handler integrando o AgentRuntime e ResultsRepository.
-func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime, resultsRepo ResultsRepository) *DefaultMessagePipelineHandler {
-	return &DefaultMessagePipelineHandler{
+// NewDefaultMessagePipelineHandler cria um novo handler integrando o AgentRuntime, ResultsRepository e opcionalmente o Coordinator.
+func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime, resultsRepo ResultsRepository, opts ...PipelineOption) *DefaultMessagePipelineHandler {
+	h := &DefaultMessagePipelineHandler{
 		runtime:     runtime,
 		resultsRepo: resultsRepo,
+		workerID:    "worker-default",
 		leaseTime:   30 * time.Second,
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
+}
+
+// PipelineOption configura o DefaultMessagePipelineHandler.
+type PipelineOption func(*DefaultMessagePipelineHandler)
+
+func WithCoordinator(coordinator ConversationCoordinator, workerID string) PipelineOption {
+	return func(h *DefaultMessagePipelineHandler) {
+		h.coordinator = coordinator
+		if workerID != "" {
+			h.workerID = workerID
+		}
 	}
 }
 
@@ -101,21 +126,42 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		// Tentativa atômica de adquirir o lock de execução (RUNNING) associado ao sequence_number
 		lockRes, err := h.resultsRepo.AcquireExecutionLockWithSeq(ctx, tenantID, convID, msgID, seqNumber, h.leaseTime)
 		if err != nil {
-			// Se está bloqueado por outro worker com lease ativo, abortamos suavemente para não duplicar
 			log.Printf("[pipeline] idempotency: message %s currently locked or running by another worker: %v. Skipping.", msgID, err)
 			return nil
 		}
 
-		// Se retornou nil sem erro, significa que já estava concluído (SUCCEEDED)
+		// Se já estava concluído (SUCCEEDED)
 		if lockRes == nil {
 			log.Printf("[pipeline] idempotency: message %s already completed (SUCCEEDED). Skipping execution.", msgID)
 			return nil
 		}
 	}
 
+	// 3. Coordenação Distribuída Atômica de Conversa (INV-02, INV-08)
+	// Operação ultra rápida no banco (sem transação longa aberta durante chamada da IA)
+	var activeExec *domain.ConversationExecution
+	if h.coordinator != nil {
+		exec, err := h.coordinator.AcquireExecution(ctx, tenantID, convID, h.workerID, h.leaseTime)
+		if err != nil {
+			if errors.Is(err, domain.ErrConversationBusy) {
+				log.Printf("[pipeline] conversation %s busy (running by another worker). Skipping concurrent execution.", convID)
+				return nil
+			}
+			return fmt.Errorf("failed to acquire distributed conversation execution: %w", err)
+		}
+		activeExec = exec
+	}
+
+	// Libera a concessão distribuída ao finalizar (garante que transações de banco não fiquem presas)
+	defer func() {
+		if h.coordinator != nil && activeExec != nil {
+			_ = h.coordinator.ReleaseExecution(context.Background(), activeExec.ID, domain.ExecutionStatusSucceeded)
+		}
+	}()
+
 	start := time.Now()
 
-	// 3. Execução do Runtime (IA / Mock)
+	// 4. Execução do Runtime (IA / Mock) - Conexões do banco já foram liberadas!
 	if h.runtime != nil {
 		execInput := domain.ExecutionInput{
 			TenantID:       tenantID,
@@ -146,7 +192,7 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		log.Printf("[pipeline] agent runtime responded successfully for seq %d: tokens=%d, reply_preview=%.40s...",
 			seqNumber, out.TokensUsed, out.ResponseContent)
 
-		// 4. Salva resultado de sucesso de forma durável no PostgreSQL ANTES de confirmar o offset
+		// 5. Salva resultado de sucesso de forma durável no PostgreSQL ANTES de confirmar o offset
 		if h.resultsRepo != nil {
 			if err := h.resultsRepo.RecordExecutionSuccess(ctx, tenantID, convID, msgID, out, execDuration); err != nil {
 				log.Printf("[pipeline] error saving execution success to db: %v", err)
@@ -192,8 +238,6 @@ func (w *ConversationWorkerService) ProcessNextMessage(ctx context.Context) erro
 func (w *ConversationWorkerService) handleMessage(ctx context.Context, msg kafka.Message) error {
 	var evt domain.Event[domain.MessageReceivedPayload]
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		// Evento totalmente corrompido ou JSON inválido:
-		// Loga erro estruturado e efetua o commit para evitar loop infinito que trave a partição.
 		log.Printf("ERROR: corrupted json payload in message (topic=%s, partition=%d, offset=%d, key=%s): %v. Payload: %s",
 			msg.Topic, msg.Partition, msg.Offset, string(msg.Key), err, string(msg.Value))
 
@@ -230,8 +274,6 @@ func (w *ConversationWorkerService) handleMessage(ctx context.Context, msg kafka
 	// Encaminha para o pipeline de execução da conversa (que salva resultado no PostgreSQL)
 	if err := w.handler.HandleMessageReceived(ctx, evt); err != nil {
 		log.Printf("ERROR: pipeline execution failed for event %s: %v", evt.EventID, err)
-		// NÃO commitar offset em caso de falha de execução de negócio ou de banco,
-		// permitindo reprocessamento at-least-once pelo grupo.
 		return fmt.Errorf("pipeline processing error: %w", err)
 	}
 
