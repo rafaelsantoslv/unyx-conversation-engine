@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"time"
 
@@ -212,7 +213,11 @@ func (w *ConversationWorkerService) Run(ctx context.Context) error {
 		default:
 			err := w.ProcessNextMessage(ctx)
 			if err != nil {
-				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+					return nil
+				}
+				// Se a conexão foi fechada durante shutdown
+				if errors.Is(err, io.EOF) {
 					return nil
 				}
 				log.Printf("worker process message error: %v", err)

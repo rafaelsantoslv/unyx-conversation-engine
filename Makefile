@@ -1,4 +1,4 @@
-.PHONY: all up down logs ps clean test run-api run-worker run-publisher
+.PHONY: all up down logs ps clean test test-e2e build run-api run-worker run-publisher
 
 all: test build
 
@@ -19,6 +19,9 @@ build:
 
 test:
 	go test -v ./...
+
+test-e2e:
+	go test -v ./tests/e2e/...
 
 run-api:
 	go run -buildvcs=false ./cmd/api
