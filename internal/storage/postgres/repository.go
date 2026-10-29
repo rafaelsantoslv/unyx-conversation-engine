@@ -195,23 +195,38 @@ func (r *Repository) SaveMessageWithOutbox(ctx context.Context, msg *domain.Mess
 		_ = tx.Rollback(ctx)
 	}()
 
-	if err := r.InsertMessage(ctx, tx, msg); err != nil {
-		if errors.Is(err, ErrDuplicateMessage) {
-			_ = tx.Rollback(ctx)
-			existing, fetchErr := r.GetMessageByExternalID(ctx, msg.TenantID, msg.ExternalMessageID)
-			if fetchErr == nil {
-				return existing, ErrDuplicateMessage
+	if msg != nil {
+		if err := r.InsertMessage(ctx, tx, msg); err != nil {
+			if errors.Is(err, ErrDuplicateMessage) {
+				_ = tx.Rollback(ctx)
+				existing, fetchErr := r.GetMessageByExternalID(ctx, msg.TenantID, msg.ExternalMessageID)
+				if fetchErr == nil {
+					return existing, ErrDuplicateMessage
+				}
+				return nil, ErrDuplicateMessage
 			}
-			return nil, ErrDuplicateMessage
+			return nil, err
 		}
-		return nil, err
 	}
 
 	if evt != nil {
-		evt.TenantID = msg.TenantID
-		evt.ConversationID = msg.ConversationID
-		if evt.PartitionKey == "" {
-			evt.PartitionKey = msg.ConversationID
+		if msg != nil {
+			evt.TenantID = msg.TenantID
+			evt.ConversationID = msg.ConversationID
+			if evt.PartitionKey == "" {
+				evt.PartitionKey = msg.ConversationID
+			}
+
+			// Se o payload do evento for do tipo MessageReceived, atualiza o sequence_number real atribuído
+			var envelope map[string]interface{}
+			if err := json.Unmarshal(evt.Payload, &envelope); err == nil {
+				if payloadMap, ok := envelope["payload"].(map[string]interface{}); ok {
+					payloadMap["sequence_number"] = msg.SequenceNumber
+					if updatedBytes, err := json.Marshal(envelope); err == nil {
+						evt.Payload = updatedBytes
+					}
+				}
+			}
 		}
 		if err := r.InsertOutboxEvent(ctx, tx, evt); err != nil {
 			return nil, err

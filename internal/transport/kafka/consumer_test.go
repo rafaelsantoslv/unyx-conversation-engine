@@ -311,3 +311,126 @@ func TestConversationWorker_WithPostgresResults_Integration(t *testing.T) {
 		t.Fatalf("repeated execution failed: %v", err)
 	}
 }
+
+
+func TestConversationWorker_StrictOrdering_Integration(t *testing.T) {
+	brokersEnv := os.Getenv("KAFKA_BROKERS")
+	if brokersEnv == "" {
+		brokersEnv = "localhost:9092"
+	}
+	brokers := strings.Split(brokersEnv, ",")
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://postgres:postgres@localhost:5432/unyx_conversation?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dbPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Skipf("skipping integration test: postgres connection failed: %v", err)
+		return
+	}
+	defer dbPool.Close()
+
+	repo := postgres.NewRepository(dbPool)
+	resultsRepo := postgres.NewResultsRepository(dbPool)
+
+	tenantID := fmt.Sprintf("tenant-ord-%d", time.Now().UnixNano())
+	conv, err := repo.GetOrCreateConversation(ctx, tenantID, "conv-ord-1")
+	if err != nil {
+		t.Fatalf("failed to create conversation: %v", err)
+	}
+
+	topic := fmt.Sprintf("test.ordering.events.%d", time.Now().UnixNano())
+	conn, err := kafka.Dial("tcp", brokers[0])
+	if err != nil {
+		t.Skipf("skipping test: kafka dial failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	_ = conn.CreateTopics(kafka.TopicConfig{
+		Topic:             topic,
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	})
+
+	publisher := transkafka.NewKafkaPublisher(brokers)
+	defer publisher.Close()
+
+	// 1. Envia 5 mensagens sequenciais para a mesma conversa
+	numMsgs := 5
+	var msgIDs []string
+	for seq := 1; seq <= numMsgs; seq++ {
+		msgID := uuid.New().String()
+		msgIDs = append(msgIDs, msgID)
+
+		evt := domain.Event[domain.MessageReceivedPayload]{
+			EventID:        fmt.Sprintf("evt-ord-%d", seq),
+			TenantID:       tenantID,
+			ConversationID: conv.ID,
+			EventType:      domain.EventTypeMessageReceived,
+			Version:        domain.EventVersionV1,
+			OccurredAt:     time.Now().UTC(),
+			Payload: domain.MessageReceivedPayload{
+				MessageID:         msgID,
+				ExternalMessageID: fmt.Sprintf("ext-ord-%d", seq),
+				Channel:           "whatsapp",
+				Role:              domain.RoleUser,
+				Content:           fmt.Sprintf("Mensagem ordenada seq=%d", seq),
+				SequenceNumber:    int64(seq),
+			},
+		}
+
+		payloadBytes, _ := json.Marshal(evt)
+		err = publisher.Publish(ctx, topic, tenantID+":"+conv.ID, payloadBytes)
+		if err != nil {
+			t.Fatalf("failed to publish message seq %d: %v", seq, err)
+		}
+	}
+
+	mockRuntime := mock.NewMockRuntime(
+		mock.WithLatency(15*time.Millisecond),
+		mock.WithSimulatedReply("Resposta ordenada"),
+	)
+	pipeline := service.NewDefaultMessagePipelineHandler(mockRuntime, resultsRepo)
+
+	consumer := transkafka.NewKafkaConsumer(transkafka.ConsumerConfig{
+		Brokers: brokers,
+		Topic:   topic,
+		GroupID: fmt.Sprintf("group-ord-%d", time.Now().UnixNano()),
+		MaxWait: 100 * time.Millisecond,
+	})
+	defer consumer.Close()
+
+	worker := service.NewConversationWorkerService(consumer, pipeline)
+
+	// 2. Processa as 5 mensagens
+	for i := 0; i < numMsgs; i++ {
+		err := worker.ProcessNextMessage(ctx)
+		if err != nil {
+			t.Fatalf("failed processing message index %d: %v", i, err)
+		}
+	}
+
+	// 3. Valida no PostgreSQL que todas as 5 mensagens foram concluídas estritamente com seus sequence_numbers corretos
+	for seq := 1; seq <= numMsgs; seq++ {
+		msgID := msgIDs[seq-1]
+		res, err := resultsRepo.GetResult(ctx, tenantID, conv.ID, msgID)
+		if err != nil {
+			t.Fatalf("failed to fetch result for seq %d: %v", seq, err)
+		}
+		if res == nil {
+			t.Fatalf("result for seq %d was not found in postgres", seq)
+		}
+		if res.Status != domain.ExecutionStatusSucceeded {
+			t.Errorf("expected SUCCEEDED for seq %d, got %s", seq, res.Status)
+		}
+		if res.SequenceNumber != int64(seq) {
+			t.Errorf("expected sequence_number %d, got %d", seq, res.SequenceNumber)
+		}
+	}
+}

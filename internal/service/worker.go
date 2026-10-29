@@ -19,18 +19,23 @@ type MessagePipelineHandler interface {
 	HandleMessageReceived(ctx context.Context, evt domain.Event[domain.MessageReceivedPayload]) error
 }
 
-// ResultsRepository define a interface necessária para registrar o ciclo de vida da execução.
+// ResultsRepository define a interface necessária para registrar o ciclo de vida da execução, ordenação e idempotência.
 type ResultsRepository interface {
 	GetResult(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error)
+	IsPrecedingSequenceCompleted(ctx context.Context, conversationID string, targetSeq int64) (bool, error)
+	AcquireExecutionLockWithSeq(ctx context.Context, tenantID, conversationID, messageID string, sequenceNumber int64, leaseDuration time.Duration) (*domain.ProcessingResult, error)
+	AcquireExecutionLock(ctx context.Context, tenantID, conversationID, messageID string, leaseDuration time.Duration) (*domain.ProcessingResult, error)
 	RecordExecutionStart(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error)
 	RecordExecutionSuccess(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, executionTime time.Duration) error
 	RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration) error
 }
 
-// DefaultMessagePipelineHandler é a implementação do pipeline que orquestra idempotência, AgentRuntime e persistência durável no PostgreSQL.
+// DefaultMessagePipelineHandler é a implementação do pipeline que orquestra idempotência durável,
+// ordenação sequencial estrita por conversa (INV-02) e paralelismo entre conversas (INV-03).
 type DefaultMessagePipelineHandler struct {
 	runtime     domain.AgentRuntime
 	resultsRepo ResultsRepository
+	leaseTime   time.Duration
 }
 
 // NewDefaultMessagePipelineHandler cria um novo handler integrando o AgentRuntime e ResultsRepository.
@@ -38,19 +43,22 @@ func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime, resultsRepo R
 	return &DefaultMessagePipelineHandler{
 		runtime:     runtime,
 		resultsRepo: resultsRepo,
+		leaseTime:   30 * time.Second,
 	}
 }
 
 func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Context, evt domain.Event[domain.MessageReceivedPayload]) error {
-	log.Printf("[pipeline] message event received: event_id=%s, tenant=%s, conv=%s, msg_id=%s, role=%s",
-		evt.EventID, evt.TenantID, evt.ConversationID, evt.Payload.MessageID, evt.Payload.Role)
+	log.Printf("[pipeline] message event received: event_id=%s, tenant=%s, conv=%s, msg_id=%s, seq=%d, role=%s",
+		evt.EventID, evt.TenantID, evt.ConversationID, evt.Payload.MessageID, evt.Payload.SequenceNumber, evt.Payload.Role)
 
 	tenantID := evt.TenantID
 	convID := evt.ConversationID
 	msgID := evt.Payload.MessageID
+	seqNumber := evt.Payload.SequenceNumber
 
-	// 1. Verificação prévia de idempotência: se o evento já foi processado com sucesso, ignorar reexecução
+	// 1. Controle de Idempotência e Concorrência Atômica via PostgreSQL
 	if h.resultsRepo != nil {
+		// Checagem prévia rápida de idempotência
 		existing, err := h.resultsRepo.GetResult(ctx, tenantID, convID, msgID)
 		if err != nil {
 			log.Printf("[pipeline] warning: failed to check existing processing result: %v", err)
@@ -58,15 +66,50 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		}
 
 		if existing != nil && existing.Status == domain.ExecutionStatusSucceeded {
-			log.Printf("[pipeline] idempotency: message %s (conv=%s) already processed with status SUCCEEDED. Skipping execution.",
-				msgID, convID)
+			log.Printf("[pipeline] idempotency: message %s (conv=%s, seq=%d) already processed with status SUCCEEDED. Skipping execution.",
+				msgID, convID, seqNumber)
 			return nil
 		}
 
-		// 2. Registra início da execução como RUNNING
-		if _, err := h.resultsRepo.RecordExecutionStart(ctx, tenantID, convID, msgID); err != nil {
-			log.Printf("[pipeline] error recording execution start: %v", err)
-			return fmt.Errorf("failed to record execution start: %w", err)
+		// 2. Garantia de Ordenação Sequencial Estrita (INV-02):
+		// Se seqNumber > 1, a mensagem N só pode ser processada após a mensagem N-1 estar SUCCEEDED.
+		if seqNumber > 1 {
+			maxWait := 10 * time.Second
+			pollInterval := 25 * time.Millisecond
+			deadline := time.Now().Add(maxWait)
+
+			precedingDone := false
+			for time.Now().Before(deadline) && ctx.Err() == nil {
+				done, checkErr := h.resultsRepo.IsPrecedingSequenceCompleted(ctx, convID, seqNumber)
+				if checkErr != nil {
+					log.Printf("[pipeline] warning: checking preceding sequence %d failed: %v", seqNumber-1, checkErr)
+				}
+				if done {
+					precedingDone = true
+					break
+				}
+				time.Sleep(pollInterval)
+			}
+
+			if !precedingDone {
+				log.Printf("[pipeline] sequence gap detected for conv=%s, msg=%s: preceding sequence %d has not completed yet",
+					convID, msgID, seqNumber-1)
+				return fmt.Errorf("preceding sequence %d not completed for conversation %s", seqNumber-1, convID)
+			}
+		}
+
+		// Tentativa atômica de adquirir o lock de execução (RUNNING) associado ao sequence_number
+		lockRes, err := h.resultsRepo.AcquireExecutionLockWithSeq(ctx, tenantID, convID, msgID, seqNumber, h.leaseTime)
+		if err != nil {
+			// Se está bloqueado por outro worker com lease ativo, abortamos suavemente para não duplicar
+			log.Printf("[pipeline] idempotency: message %s currently locked or running by another worker: %v. Skipping.", msgID, err)
+			return nil
+		}
+
+		// Se retornou nil sem erro, significa que já estava concluído (SUCCEEDED)
+		if lockRes == nil {
+			log.Printf("[pipeline] idempotency: message %s already completed (SUCCEEDED). Skipping execution.", msgID)
+			return nil
 		}
 	}
 
@@ -80,9 +123,10 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 			MessageID:      msgID,
 			Content:        evt.Payload.Content,
 			Metadata: map[string]string{
-				"channel":  evt.Payload.Channel,
-				"role":     string(evt.Payload.Role),
-				"event_id": evt.EventID,
+				"channel":         evt.Payload.Channel,
+				"role":            string(evt.Payload.Role),
+				"event_id":        evt.EventID,
+				"sequence_number": fmt.Sprintf("%d", seqNumber),
 			},
 		}
 
@@ -99,10 +143,10 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 			return fmt.Errorf("agent runtime execution error: %w", err)
 		}
 
-		log.Printf("[pipeline] agent runtime responded successfully: tokens=%d, reply_preview=%.40s...",
-			out.TokensUsed, out.ResponseContent)
+		log.Printf("[pipeline] agent runtime responded successfully for seq %d: tokens=%d, reply_preview=%.40s...",
+			seqNumber, out.TokensUsed, out.ResponseContent)
 
-		// 4. Salva resultado de sucesso de forma durável no PostgreSQL
+		// 4. Salva resultado de sucesso de forma durável no PostgreSQL ANTES de confirmar o offset
 		if h.resultsRepo != nil {
 			if err := h.resultsRepo.RecordExecutionSuccess(ctx, tenantID, convID, msgID, out, execDuration); err != nil {
 				log.Printf("[pipeline] error saving execution success to db: %v", err)
@@ -191,7 +235,7 @@ func (w *ConversationWorkerService) handleMessage(ctx context.Context, msg kafka
 		return fmt.Errorf("pipeline processing error: %w", err)
 	}
 
-	// Efetua commit manual do offset APÓS sucesso na persistência do resultado no PostgreSQL
+	// Efetua commit manual do offset APÓS sucesso na persistência do resultado no PostgreSQL (INV-07)
 	if err := w.consumer.CommitMessages(ctx, msg); err != nil {
 		log.Printf("ERROR: failed to commit offset for event %s (offset=%d): %v",
 			evt.EventID, msg.Offset, err)
@@ -216,7 +260,6 @@ func (w *ConversationWorkerService) Run(ctx context.Context) error {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 					return nil
 				}
-				// Se a conexão foi fechada durante shutdown
 				if errors.Is(err, io.EOF) {
 					return nil
 				}

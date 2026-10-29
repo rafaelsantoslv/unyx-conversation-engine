@@ -28,10 +28,13 @@ type ProcessingResult struct {
 	TenantID        string          `json:"tenant_id"`
 	ConversationID  string          `json:"conversation_id"`
 	MessageID       string          `json:"message_id"`
+	SequenceNumber  int64           `json:"sequence_number"`
 	Status          ExecutionStatus `json:"status"`
 	OutputPayload   json.RawMessage `json:"output_payload,omitempty"`
 	ErrorMessage    *string         `json:"error_message,omitempty"`
 	ExecutionTimeMS int64           `json:"execution_time_ms"`
 	CreatedAt       time.Time       `json:"created_at"`
 	CompletedAt     *time.Time      `json:"completed_at,omitempty"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	LeaseExpiresAt  *time.Time      `json:"lease_expires_at,omitempty"`
 }

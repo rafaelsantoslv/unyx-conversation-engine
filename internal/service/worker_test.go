@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,6 +61,7 @@ func (m *mockPipelineHandler) HandleMessageReceived(ctx context.Context, evt dom
 }
 
 type mockResultsRepo struct {
+	mu           sync.Mutex
 	results      map[string]*domain.ProcessingResult
 	startCalls   int
 	successCalls int
@@ -75,6 +77,8 @@ func newMockResultsRepo() *mockResultsRepo {
 }
 
 func (m *mockResultsRepo) GetResult(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.getErr != nil {
 		return nil, m.getErr
 	}
@@ -82,17 +86,40 @@ func (m *mockResultsRepo) GetResult(ctx context.Context, tenantID, conversationI
 	return m.results[key], nil
 }
 
-func (m *mockResultsRepo) RecordExecutionStart(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error) {
+func (m *mockResultsRepo) IsPrecedingSequenceCompleted(ctx context.Context, conversationID string, targetSeq int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if targetSeq <= 1 {
+		return true, nil
+	}
+	precedingSeq := targetSeq - 1
+	for _, res := range m.results {
+		if res.ConversationID == conversationID && res.SequenceNumber == precedingSeq {
+			return res.Status == domain.ExecutionStatusSucceeded, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *mockResultsRepo) AcquireExecutionLockWithSeq(ctx context.Context, tenantID, conversationID, messageID string, sequenceNumber int64, leaseDuration time.Duration) (*domain.ProcessingResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.saveErr != nil {
 		return nil, m.saveErr
 	}
-	m.startCalls++
 	key := tenantID + ":" + conversationID + ":" + messageID
+	if existing, ok := m.results[key]; ok {
+		if existing.Status == domain.ExecutionStatusSucceeded {
+			return nil, nil // já concluído
+		}
+	}
+	m.startCalls++
 	res := &domain.ProcessingResult{
 		ID:             "res-1",
 		TenantID:       tenantID,
 		ConversationID: conversationID,
 		MessageID:      messageID,
+		SequenceNumber: sequenceNumber,
 		Status:         domain.ExecutionStatusRunning,
 		CreatedAt:      time.Now(),
 	}
@@ -100,7 +127,17 @@ func (m *mockResultsRepo) RecordExecutionStart(ctx context.Context, tenantID, co
 	return res, nil
 }
 
+func (m *mockResultsRepo) AcquireExecutionLock(ctx context.Context, tenantID, conversationID, messageID string, leaseDuration time.Duration) (*domain.ProcessingResult, error) {
+	return m.AcquireExecutionLockWithSeq(ctx, tenantID, conversationID, messageID, 1, leaseDuration)
+}
+
+func (m *mockResultsRepo) RecordExecutionStart(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error) {
+	return m.AcquireExecutionLock(ctx, tenantID, conversationID, messageID, 30*time.Second)
+}
+
 func (m *mockResultsRepo) RecordExecutionSuccess(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, execTime time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.saveErr != nil {
 		return m.saveErr
 	}
@@ -114,6 +151,8 @@ func (m *mockResultsRepo) RecordExecutionSuccess(ctx context.Context, tenantID, 
 }
 
 func (m *mockResultsRepo) RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failErr error, execTime time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.saveErr != nil {
 		return m.saveErr
 	}
@@ -127,12 +166,15 @@ func (m *mockResultsRepo) RecordExecutionFailure(ctx context.Context, tenantID, 
 }
 
 type mockAgentRuntime struct {
+	mu     sync.Mutex
 	output *domain.ExecutionOutput
 	err    error
 	calls  int
 }
 
 func (m *mockAgentRuntime) Execute(ctx context.Context, input domain.ExecutionInput) (*domain.ExecutionOutput, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.calls++
 	if m.err != nil {
 		return nil, m.err
@@ -255,81 +297,123 @@ func TestConversationWorkerService(t *testing.T) {
 	})
 }
 
-func TestDefaultMessagePipelineHandler_WithResultsRepo(t *testing.T) {
+func TestDefaultMessagePipelineHandler_OrderingAndIdempotency(t *testing.T) {
 	ctx := context.Background()
-	evt := domain.Event[domain.MessageReceivedPayload]{
-		EventID:        "evt-pipe-1",
-		TenantID:       "tenant-1",
-		ConversationID: "conv-1",
-		EventType:      domain.EventTypeMessageReceived,
-		Version:        domain.EventVersionV1,
-		OccurredAt:     time.Now(),
-		Payload: domain.MessageReceivedPayload{
-			MessageID:         "msg-1",
-			ExternalMessageID: "ext-1",
-			Channel:           "whatsapp",
-			Role:              domain.RoleUser,
-			Content:           "Olá, teste com results",
-		},
-	}
 
-	t.Run("records start and success in database", func(t *testing.T) {
+	t.Run("processes sequentially ordered messages (seq 1 then seq 2)", func(t *testing.T) {
 		resultsRepo := newMockResultsRepo()
 		runtime := &mockAgentRuntime{}
 		pipeline := service.NewDefaultMessagePipelineHandler(runtime, resultsRepo)
 
-		err := pipeline.HandleMessageReceived(ctx, evt)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		evt1 := domain.Event[domain.MessageReceivedPayload]{
+			EventID:        "evt-seq-1",
+			TenantID:       "tenant-1",
+			ConversationID: "conv-1",
+			EventType:      domain.EventTypeMessageReceived,
+			OccurredAt:     time.Now(),
+			Payload: domain.MessageReceivedPayload{
+				MessageID:      "msg-1",
+				SequenceNumber: 1,
+				Content:        "Quero agendar",
+				Role:           domain.RoleUser,
+			},
 		}
 
-		if resultsRepo.startCalls != 1 {
-			t.Errorf("expected 1 start call, got %d", resultsRepo.startCalls)
+		evt2 := domain.Event[domain.MessageReceivedPayload]{
+			EventID:        "evt-seq-2",
+			TenantID:       "tenant-1",
+			ConversationID: "conv-1",
+			EventType:      domain.EventTypeMessageReceived,
+			OccurredAt:     time.Now(),
+			Payload: domain.MessageReceivedPayload{
+				MessageID:      "msg-2",
+				SequenceNumber: 2,
+				Content:        "Amanhã",
+				Role:           domain.RoleUser,
+			},
 		}
-		if resultsRepo.successCalls != 1 {
-			t.Errorf("expected 1 success call, got %d", resultsRepo.successCalls)
+
+		// Processa 1 primeiro
+		if err := pipeline.HandleMessageReceived(ctx, evt1); err != nil {
+			t.Fatalf("failed to process seq 1: %v", err)
 		}
-		if runtime.calls != 1 {
-			t.Errorf("expected 1 runtime call, got %d", runtime.calls)
+		// Em seguida processa 2
+		if err := pipeline.HandleMessageReceived(ctx, evt2); err != nil {
+			t.Fatalf("failed to process seq 2: %v", err)
+		}
+
+		if runtime.calls != 2 {
+			t.Errorf("expected 2 runtime calls, got %d", runtime.calls)
 		}
 	})
 
-	t.Run("idempotency: skips execution if message is already SUCCEEDED", func(t *testing.T) {
+	t.Run("fails or waits when gap detected: seq 2 arrives before seq 1 completes", func(t *testing.T) {
 		resultsRepo := newMockResultsRepo()
-		// Pré-popula como SUCCEEDED
-		resultsRepo.results["tenant-1:conv-1:msg-1"] = &domain.ProcessingResult{
-			Status: domain.ExecutionStatusSucceeded,
-		}
-
 		runtime := &mockAgentRuntime{}
 		pipeline := service.NewDefaultMessagePipelineHandler(runtime, resultsRepo)
 
-		err := pipeline.HandleMessageReceived(ctx, evt)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		evt2 := domain.Event[domain.MessageReceivedPayload]{
+			EventID:        "evt-gap-2",
+			TenantID:       "tenant-1",
+			ConversationID: "conv-gap",
+			EventType:      domain.EventTypeMessageReceived,
+			OccurredAt:     time.Now(),
+			Payload: domain.MessageReceivedPayload{
+				MessageID:      "msg-2",
+				SequenceNumber: 2,
+				Content:        "Amanhã sem seq 1",
+				Role:           domain.RoleUser,
+			},
 		}
 
-		// Não deve chamar runtime nem start/success novamente
-		if runtime.calls != 0 {
-			t.Errorf("runtime should NOT be called for already succeeded message, got %d calls", runtime.calls)
-		}
-		if resultsRepo.startCalls != 0 {
-			t.Errorf("start should NOT be called, got %d", resultsRepo.startCalls)
-		}
-	})
+		// Context com timeout curto para não travar o teste
+		shortCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+		defer cancel()
 
-	t.Run("records failure when runtime fails", func(t *testing.T) {
-		resultsRepo := newMockResultsRepo()
-		runtime := &mockAgentRuntime{err: errors.New("runtime 500 error")}
-		pipeline := service.NewDefaultMessagePipelineHandler(runtime, resultsRepo)
-
-		err := pipeline.HandleMessageReceived(ctx, evt)
+		err := pipeline.HandleMessageReceived(shortCtx, evt2)
 		if err == nil {
-			t.Fatalf("expected error from pipeline, got nil")
+			t.Fatalf("expected error due to sequence gap, got nil")
 		}
 
-		if resultsRepo.failureCalls != 1 {
-			t.Errorf("expected 1 failure call, got %d", resultsRepo.failureCalls)
+		// Runtime NÃO pode ter sido executado para seq 2
+		if runtime.calls != 0 {
+			t.Errorf("runtime should NOT be called when preceding sequence is missing, got %d calls", runtime.calls)
+		}
+	})
+
+	t.Run("parallel execution across different conversations (INV-03)", func(t *testing.T) {
+		resultsRepo := newMockResultsRepo()
+		runtime := &mockAgentRuntime{}
+		pipeline := service.NewDefaultMessagePipelineHandler(runtime, resultsRepo)
+
+		var wg sync.WaitGroup
+		convs := []string{"conv-A", "conv-B", "conv-C"}
+
+		for _, convID := range convs {
+			wg.Add(1)
+			go func(c string) {
+				defer wg.Done()
+				evt := domain.Event[domain.MessageReceivedPayload]{
+					EventID:        "evt-" + c,
+					TenantID:       "tenant-1",
+					ConversationID: c,
+					EventType:      domain.EventTypeMessageReceived,
+					OccurredAt:     time.Now(),
+					Payload: domain.MessageReceivedPayload{
+						MessageID:      "msg-" + c,
+						SequenceNumber: 1,
+						Content:        "Mensagem de " + c,
+						Role:           domain.RoleUser,
+					},
+				}
+				_ = pipeline.HandleMessageReceived(ctx, evt)
+			}(convID)
+		}
+
+		wg.Wait()
+
+		if runtime.calls != 3 {
+			t.Errorf("expected 3 runtime calls for distinct conversations, got %d", runtime.calls)
 		}
 	})
 }

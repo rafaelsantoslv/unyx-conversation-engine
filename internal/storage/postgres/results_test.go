@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,13 +70,13 @@ func TestResultsRepository_Integration(t *testing.T) {
 			t.Errorf("expected nil initial result, got %+v", initial)
 		}
 
-		// 2. Registra início como RUNNING
-		startRes, err := resultsRepo.RecordExecutionStart(ctx, tenantID, conv.ID, msg.ID)
+		// 2. Registra início como RUNNING via AcquireExecutionLock
+		startRes, err := resultsRepo.AcquireExecutionLock(ctx, tenantID, conv.ID, msg.ID, 30*time.Second)
 		if err != nil {
 			t.Fatalf("failed to record execution start: %v", err)
 		}
-		if startRes.Status != domain.ExecutionStatusRunning {
-			t.Errorf("expected status RUNNING, got %s", startRes.Status)
+		if startRes == nil || startRes.Status != domain.ExecutionStatusRunning {
+			t.Fatalf("expected status RUNNING, got %+v", startRes)
 		}
 
 		// 3. Registra sucesso
@@ -106,6 +107,15 @@ func TestResultsRepository_Integration(t *testing.T) {
 		if finalRes.CompletedAt == nil {
 			t.Errorf("expected completed_at to be non-nil")
 		}
+
+		// 5. Tentativa subsequente de lock para evento já SUCCEEDED deve retornar nil (idempotência)
+		subsequentLock, err := resultsRepo.AcquireExecutionLock(ctx, tenantID, conv.ID, msg.ID, 30*time.Second)
+		if err != nil {
+			t.Fatalf("unexpected error on subsequent lock: %v", err)
+		}
+		if subsequentLock != nil {
+			t.Errorf("expected nil lock for already SUCCEEDED message, got %+v", subsequentLock)
+		}
 	})
 
 	t.Run("records execution failure properly", func(t *testing.T) {
@@ -124,7 +134,7 @@ func TestResultsRepository_Integration(t *testing.T) {
 		}
 
 		// Registra início
-		_, err = resultsRepo.RecordExecutionStart(ctx, tenantID, conv.ID, failMsg.ID)
+		_, err = resultsRepo.AcquireExecutionLock(ctx, tenantID, conv.ID, failMsg.ID, 30*time.Second)
 		if err != nil {
 			t.Fatalf("failed to record execution start: %v", err)
 		}
@@ -148,6 +158,47 @@ func TestResultsRepository_Integration(t *testing.T) {
 		}
 		if failRes.ExecutionTimeMS != 1200 {
 			t.Errorf("expected execution time 1200ms, got %d", failRes.ExecutionTimeMS)
+		}
+	})
+
+	t.Run("concurrency test: multiple goroutines competing for execution lock", func(t *testing.T) {
+		concurMsgID := uuid.New().String()
+		concurMsg := &domain.Message{
+			ID:                concurMsgID,
+			TenantID:          tenantID,
+			ConversationID:    conv.ID,
+			ExternalMessageID: fmt.Sprintf("ext-concur-%d", time.Now().UnixNano()),
+			Role:              domain.RoleUser,
+			Content:           "Mensagem concorrente",
+		}
+		_, err := repo.SaveMessage(ctx, concurMsg)
+		if err != nil {
+			t.Fatalf("failed to insert concur message: %v", err)
+		}
+
+		workersCount := 10
+		var wg sync.WaitGroup
+		acquiredCount := 0
+		var mu sync.Mutex
+
+		for i := 0; i < workersCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				res, lockErr := resultsRepo.AcquireExecutionLock(ctx, tenantID, conv.ID, concurMsgID, 10*time.Second)
+				if lockErr == nil && res != nil {
+					mu.Lock()
+					acquiredCount++
+					mu.Unlock()
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		// Exatamente 1 worker deve ter conseguido o lock inicial
+		if acquiredCount != 1 {
+			t.Fatalf("expected exactly 1 worker to acquire lock, got %d", acquiredCount)
 		}
 	})
 }

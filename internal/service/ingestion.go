@@ -55,6 +55,7 @@ func (s *IngestionService) IngestMessage(ctx context.Context, req dto.IngestMess
 			Channel:           req.Channel,
 			Role:              msg.Role,
 			Content:           msg.Content,
+			SequenceNumber:    0, // preenchido atomicamente no banco ou calculado
 		},
 	}
 
@@ -73,7 +74,7 @@ func (s *IngestionService) IngestMessage(ctx context.Context, req dto.IngestMess
 		CreatedAt:      msg.CreatedAt,
 	}
 
-	_, err = s.repo.SaveMessageWithOutbox(ctx, msg, outboxEvt)
+	savedMsg, err := s.repo.SaveMessageWithOutbox(ctx, msg, outboxEvt)
 	if err != nil {
 		if errors.Is(err, postgres.ErrDuplicateMessage) {
 			return nil
@@ -81,5 +82,6 @@ func (s *IngestionService) IngestMessage(ctx context.Context, req dto.IngestMess
 		return err
 	}
 
+	_ = savedMsg
 	return nil
 }
