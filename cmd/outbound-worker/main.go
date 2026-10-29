@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/banner"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/config"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/integration/chatwoot"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/outbound"
@@ -21,6 +22,7 @@ import (
 )
 
 func main() {
+	banner.Print("Outbound Worker", "1.0.0")
 	telemetry.SetGlobalLogger(telemetry.NewJSONLogger(os.Stdout, 0))
 
 	cfg, err := config.Load(8083)

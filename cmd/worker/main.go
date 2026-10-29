@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/banner"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/config"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/runtime/mock"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/service"
@@ -23,6 +24,7 @@ import (
 )
 
 func main() {
+	banner.Print("Worker Engine", "1.0.0")
 	telemetry.SetGlobalLogger(telemetry.NewJSONLogger(os.Stdout, 0))
 
 	cfg, err := config.Load(8081)
