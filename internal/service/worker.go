@@ -476,9 +476,10 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 
 // ConversationWorkerService orquestra o consumo de eventos, desserialização, validação, execução e commit manual.
 type ConversationWorkerService struct {
-	consumer    transkafka.Consumer
-	handler     MessagePipelineHandler
-	resultsRepo ResultsRepository
+	consumer       transkafka.Consumer
+	handler        MessagePipelineHandler
+	resultsRepo    ResultsRepository
+	concurrencySem chan struct{} // semáforo de controle de concorrência e backpressure (OPS-09)
 }
 
 // WorkerServiceOption configura o ConversationWorkerService.
@@ -488,6 +489,15 @@ type WorkerServiceOption func(*ConversationWorkerService)
 func WithWorkerResultsRepo(repo ResultsRepository) WorkerServiceOption {
 	return func(w *ConversationWorkerService) {
 		w.resultsRepo = repo
+	}
+}
+
+// WithMaxConcurrentExecutions define o limite máximo de execuções simultâneas em paralelo (Backpressure / OPS-09).
+func WithMaxConcurrentExecutions(max int) WorkerServiceOption {
+	return func(w *ConversationWorkerService) {
+		if max > 0 {
+			w.concurrencySem = make(chan struct{}, max)
+		}
 	}
 }
 
@@ -508,6 +518,16 @@ func NewConversationWorkerService(consumer transkafka.Consumer, handler MessageP
 
 // ProcessNextMessage busca a próxima mensagem no Kafka, valida e processa com commit manual.
 func (w *ConversationWorkerService) ProcessNextMessage(ctx context.Context) error {
+	// Se semáforo de backpressure estiver configurado, adquire vaga antes de fazer fetch
+	if w.concurrencySem != nil {
+		select {
+		case w.concurrencySem <- struct{}{}:
+			defer func() { <-w.concurrencySem }()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	msg, err := w.consumer.FetchMessage(ctx)
 	if err != nil {
 		return err

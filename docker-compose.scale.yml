@@ -1,0 +1,48 @@
+services:
+  conversation-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/app/worker"]
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/unyx_conversation?sslmode=disable
+      - KAFKA_BROKERS=kafka:29092
+      - PORT=8081
+      - MAX_CONCURRENT_EXECUTIONS=10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  conversation-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/app/worker"]
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/unyx_conversation?sslmode=disable
+      - KAFKA_BROKERS=kafka:29092
+      - PORT=8084
+      - MAX_CONCURRENT_EXECUTIONS=10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  conversation-worker-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/app/worker"]
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/unyx_conversation?sslmode=disable
+      - KAFKA_BROKERS=kafka:29092
+      - PORT=8085
+      - MAX_CONCURRENT_EXECUTIONS=10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy

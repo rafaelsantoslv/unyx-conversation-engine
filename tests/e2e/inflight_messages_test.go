@@ -32,7 +32,7 @@ func TestInFlightMessages_SubsequentExecutionCycle(t *testing.T) {
 	schedRepo := postgres.NewScheduleRepository(pool)
 	resultsRepo := postgres.NewResultsRepository(pool)
 
-	tenantID := "tenant-inflight-e2e"
+	tenantID := "tenant-inflight-" + uuid.New().String()
 	conv, err := coreRepo.GetOrCreateConversation(ctx, tenantID, "ext-"+uuid.New().String())
 	require.NoError(t, err)
 
@@ -48,9 +48,9 @@ func TestInFlightMessages_SubsequentExecutionCycle(t *testing.T) {
 	saved1, err := coreRepo.SaveMessage(ctx, msg1)
 	require.NoError(t, err)
 
-	// Mock Runtime com latência artificial de 400ms para simular IA pensando
+	// Mock Runtime com latência artificial de 600ms para simular IA pensando
 	delayedRuntime := mock.NewMockRuntime(
-		mock.WithLatency(400 * time.Millisecond),
+		mock.WithLatency(600 * time.Millisecond),
 		mock.WithSimulatedReply("Resposta gerada pela IA"),
 	)
 
@@ -117,7 +117,7 @@ func TestInFlightMessages_SubsequentExecutionCycle(t *testing.T) {
 	assert.Equal(t, domain.ScheduleStatusPending, sched.Status, "agendamento deve estar PENDING para atender as mensagens in-flight")
 
 	// 6. O Scheduler reivindica a execução do lote subsequente
-	claimed, err := schedRepo.ClaimDueSchedulesWithOutbox(ctx, 10, time.Now().UTC())
+	claimed, err := schedRepo.ClaimDueSchedulesWithOutbox(ctx, 100, time.Now().UTC().Add(1*time.Second))
 	require.NoError(t, err)
 
 	var foundSubsequent *domain.ConversationSchedule
