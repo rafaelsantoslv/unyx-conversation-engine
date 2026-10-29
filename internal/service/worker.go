@@ -31,6 +31,7 @@ type ResultsRepository interface {
 	RecordExecutionSuccessWithFencing(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, executionTime time.Duration, fencingToken int64) error
 	RecordExecutionFailure(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration) error
 	RecordExecutionFailureWithFencing(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration, fencingToken int64) error
+	ScheduleRetry(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, baseBackoff, maxBackoff time.Duration) (bool, time.Time, error)
 }
 
 // ConversationCoordinator define o contrato para coordenação distribuída entre múltiplos workers (INV-02, INV-04, INV-08).
@@ -50,6 +51,8 @@ type DefaultMessagePipelineHandler struct {
 	workerID          string
 	leaseTime         time.Duration
 	heartbeatInterval time.Duration
+	baseBackoff       time.Duration
+	maxBackoff        time.Duration
 }
 
 // NewDefaultMessagePipelineHandler cria um novo handler integrando o AgentRuntime, ResultsRepository e opcionalmente o Coordinator.
@@ -60,6 +63,8 @@ func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime, resultsRepo R
 		workerID:          "worker-default",
 		leaseTime:         30 * time.Second,
 		heartbeatInterval: 10 * time.Second,
+		baseBackoff:       500 * time.Millisecond,
+		maxBackoff:        30 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -69,6 +74,17 @@ func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime, resultsRepo R
 
 // PipelineOption configura o DefaultMessagePipelineHandler.
 type PipelineOption func(*DefaultMessagePipelineHandler)
+
+func WithRetrySettings(baseBackoff, maxBackoff time.Duration) PipelineOption {
+	return func(h *DefaultMessagePipelineHandler) {
+		if baseBackoff > 0 {
+			h.baseBackoff = baseBackoff
+		}
+		if maxBackoff > 0 {
+			h.maxBackoff = maxBackoff
+		}
+	}
+}
 
 func WithCoordinator(coordinator ConversationCoordinator, workerID string) PipelineOption {
 	return func(h *DefaultMessagePipelineHandler) {
@@ -229,12 +245,24 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		if err != nil {
 			log.Printf("[pipeline] agent runtime failed for message %s: %v", msgID, err)
 			if h.resultsRepo != nil {
-				var token int64
-				if activeExec != nil {
-					token = activeExec.FencingToken
-				}
-				if recErr := h.resultsRepo.RecordExecutionFailureWithFencing(context.Background(), tenantID, convID, msgID, err, execDuration, token); recErr != nil {
-					log.Printf("[pipeline] warning: failed to record execution failure in db: %v", recErr)
+				// Avalia retry durável com backoff exponencial e jitter (INV-05, INV-06)
+				isRetryable, nextRetry, schedErr := h.resultsRepo.ScheduleRetry(
+					context.Background(),
+					tenantID,
+					convID,
+					msgID,
+					err,
+					h.baseBackoff,
+					h.maxBackoff,
+				)
+				if schedErr != nil {
+					log.Printf("[pipeline] warning: failed to schedule retry: %v", schedErr)
+				} else if isRetryable {
+					log.Printf("[pipeline] transient failure scheduled for retry: conv=%s, msg=%s, next_retry_at=%v",
+						convID, msgID, nextRetry)
+				} else {
+					log.Printf("[pipeline] permanent failure recorded (no retry): conv=%s, msg=%s, err=%v",
+						convID, msgID, err)
 				}
 			}
 			return fmt.Errorf("agent runtime execution error: %w", err)

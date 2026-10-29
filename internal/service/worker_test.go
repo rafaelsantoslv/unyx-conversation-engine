@@ -184,6 +184,50 @@ func (m *mockResultsRepo) RecordExecutionFailureWithFencing(ctx context.Context,
 	return nil
 }
 
+func (m *mockResultsRepo) ScheduleRetry(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, baseBackoff, maxBackoff time.Duration) (bool, time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.saveErr != nil {
+		return false, time.Time{}, m.saveErr
+	}
+	m.failureCalls++
+	key := tenantID + ":" + conversationID + ":" + messageID
+	res, ok := m.results[key]
+	if !ok {
+		res = &domain.ProcessingResult{
+			TenantID:       tenantID,
+			ConversationID: conversationID,
+			MessageID:      messageID,
+			MaxAttempts:    3,
+		}
+		m.results[key] = res
+	}
+
+	errMsg := failureErr.Error()
+	res.LastError = &errMsg
+	res.AttemptCount++
+
+	if failureErr.Error() == "transient error" || failureErr.Error() == "503 Service Unavailable" {
+		if res.AttemptCount >= 3 {
+			res.Status = domain.ExecutionStatusFailed
+			errType := "TRANS"
+			res.ErrorType = &errType
+			return false, time.Time{}, nil
+		}
+		res.Status = domain.ExecutionStatusPending
+		errType := "TRANS"
+		res.ErrorType = &errType
+		nextRetry := time.Now().Add(baseBackoff)
+		res.NextRetryAt = &nextRetry
+		return true, nextRetry, nil
+	}
+
+	res.Status = domain.ExecutionStatusFailed
+	errType := "PERM"
+	res.ErrorType = &errType
+	return false, time.Time{}, nil
+}
+
 type mockAgentRuntime struct {
 	mu     sync.Mutex
 	output *domain.ExecutionOutput
@@ -488,6 +532,52 @@ func TestDefaultMessagePipelineHandler_OrderingAndIdempotency(t *testing.T) {
 			}
 		case <-time.After(500 * time.Millisecond):
 			t.Fatalf("timed out waiting for cooperative cancellation")
+		}
+	})
+
+	t.Run("schedules retry for transient error without committing failure immediately (INV-05, INV-06)", func(t *testing.T) {
+		resultsRepo := newMockResultsRepo()
+		runtime := &mockAgentRuntime{
+			err: errors.New("503 Service Unavailable"),
+		}
+		pipeline := service.NewDefaultMessagePipelineHandler(runtime, resultsRepo, service.WithRetrySettings(10*time.Millisecond, 50*time.Millisecond))
+
+		evt := domain.Event[domain.MessageReceivedPayload]{
+			EventID:        "evt-retry-1",
+			TenantID:       "tenant-1",
+			ConversationID: "conv-retry",
+			EventType:      domain.EventTypeMessageReceived,
+			OccurredAt:     time.Now(),
+			Payload: domain.MessageReceivedPayload{
+				MessageID:      "msg-transient-1",
+				SequenceNumber: 1,
+				Content:        "Tentativa com falha transitória",
+				Role:           domain.RoleUser,
+			},
+		}
+
+		err := pipeline.HandleMessageReceived(ctx, evt)
+		if err == nil {
+			t.Fatalf("expected error from handler when runtime fails")
+		}
+
+		// Verifica se o resultado foi registrado com status PENDING (agendado para retry)
+		key := "tenant-1:conv-retry:msg-transient-1"
+		res := resultsRepo.results[key]
+		if res == nil {
+			t.Fatalf("expected processing result to be recorded")
+		}
+		if res.Status != domain.ExecutionStatusPending {
+			t.Errorf("expected status PENDING for retry, got %s", res.Status)
+		}
+		if res.NextRetryAt == nil {
+			t.Errorf("expected NextRetryAt to be set")
+		}
+		if res.AttemptCount != 1 {
+			t.Errorf("expected AttemptCount 1, got %d", res.AttemptCount)
+		}
+		if res.ErrorType == nil || *res.ErrorType != "TRANS" {
+			t.Errorf("expected ErrorType TRANS, got %v", res.ErrorType)
 		}
 	})
 }

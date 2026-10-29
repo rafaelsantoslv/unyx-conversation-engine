@@ -255,3 +255,111 @@ func TestResultsRepository_Integration(t *testing.T) {
 		}
 	})
 }
+
+
+func TestResultsRepository_ScheduleRetry_Integration(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://postgres:postgres@localhost:5432/unyx_conversation?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Skipf("skipping test: database connection failed: %v", err)
+		return
+	}
+	defer pool.Close()
+
+	repo := postgres.NewRepository(pool)
+	resultsRepo := postgres.NewResultsRepository(pool)
+
+	tenantID := fmt.Sprintf("tenant-retry-%d", time.Now().UnixNano())
+	conv, err := repo.GetOrCreateConversation(ctx, tenantID, "conv-retry-1")
+	if err != nil {
+		t.Fatalf("failed to create conv: %v", err)
+	}
+
+	msgID := uuid.New().String()
+	msg := &domain.Message{
+		ID:                msgID,
+		TenantID:          tenantID,
+		ConversationID:    conv.ID,
+		ExternalMessageID: "ext-msg-retry",
+		Role:              domain.RoleUser,
+		Content:           "Mensagem de teste retry",
+	}
+	_, _ = repo.SaveMessage(ctx, msg)
+
+	t.Run("schedules retry for transient 503 error", func(t *testing.T) {
+		// 1. Inicia execução
+		_, err := resultsRepo.AcquireExecutionLock(ctx, tenantID, conv.ID, msgID, 10*time.Second)
+		if err != nil {
+			t.Fatalf("failed to acquire lock: %v", err)
+		}
+
+		// 2. Erro transitório 503
+		transientErr := errors.New("upstream service unavailable 503")
+		scheduled, nextRetry, err := resultsRepo.ScheduleRetry(ctx, tenantID, conv.ID, msgID, transientErr, 50*time.Millisecond, 2*time.Second)
+		if err != nil {
+			t.Fatalf("ScheduleRetry failed: %v", err)
+		}
+
+		if !scheduled {
+			t.Fatalf("expected transient error to be scheduled for retry")
+		}
+
+		if nextRetry.Before(time.Now()) {
+			t.Errorf("nextRetry should be in the future, got %v", nextRetry)
+		}
+
+		res, err := resultsRepo.GetResult(ctx, tenantID, conv.ID, msgID)
+		if err != nil {
+			t.Fatalf("failed to get result: %v", err)
+		}
+		if res.Status != domain.ExecutionStatusPending {
+			t.Errorf("expected status PENDING, got %s", res.Status)
+		}
+		if res.AttemptCount != 1 {
+			t.Errorf("expected attempt_count 1, got %d", res.AttemptCount)
+		}
+		if res.ErrorType == nil || *res.ErrorType != "TRANSIENT" {
+			t.Errorf("expected TRANSIENT error type, got %v", res.ErrorType)
+		}
+	})
+
+	t.Run("marks FAILED immediately for permanent 400 error without retry", func(t *testing.T) {
+		permMsgID := uuid.New().String()
+		permMsg := &domain.Message{
+			ID:                permMsgID,
+			TenantID:          tenantID,
+			ConversationID:    conv.ID,
+			ExternalMessageID: "ext-msg-perm",
+			Role:              domain.RoleUser,
+			Content:           "Permanente",
+		}
+		_, _ = repo.SaveMessage(ctx, permMsg)
+
+		_, _ = resultsRepo.AcquireExecutionLock(ctx, tenantID, conv.ID, permMsgID, 10*time.Second)
+
+		permErr := errors.New("HTTP 400: invalid prompt syntax")
+		scheduled, _, err := resultsRepo.ScheduleRetry(ctx, tenantID, conv.ID, permMsgID, permErr, 50*time.Millisecond, 2*time.Second)
+		if err != nil {
+			t.Fatalf("ScheduleRetry failed: %v", err)
+		}
+
+		if scheduled {
+			t.Fatalf("permanent error must NOT be scheduled for retry")
+		}
+
+		res, _ := resultsRepo.GetResult(ctx, tenantID, conv.ID, permMsgID)
+		if res.Status != domain.ExecutionStatusFailed {
+			t.Errorf("expected status FAILED, got %s", res.Status)
+		}
+		if res.ErrorType == nil || *res.ErrorType != "PERMANENT" {
+			t.Errorf("expected PERMANENT error type, got %v", res.ErrorType)
+		}
+	})
+}

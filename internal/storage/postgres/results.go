@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/domain"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/pkg/retry"
 )
 
 var (
@@ -20,7 +21,8 @@ var (
 	ErrExecutionLocked = errors.New("execution is currently running with active lease")
 )
 
-// ResultsRepository gerencia a persistência durável dos resultados de processamento e controle de idempotência.
+// ResultsRepository gerencia a persistência durável dos resultados de processamento,
+// idempotência com fencing token e agendamento durável de retries com backoff.
 type ResultsRepository struct {
 	pool *pgxpool.Pool
 }
@@ -29,10 +31,10 @@ func NewResultsRepository(pool *pgxpool.Pool) *ResultsRepository {
 	return &ResultsRepository{pool: pool}
 }
 
-// GetResult busca o resultado existente de uma mensagem para checagem de idempotência.
+// GetResult busca o resultado existente de uma mensagem para checagem de idempotência e retries.
 func (r *ResultsRepository) GetResult(ctx context.Context, tenantID, conversationID, messageID string) (*domain.ProcessingResult, error) {
 	query := `
-	SELECT id, tenant_id, conversation_id, message_id, sequence_number, status, output_payload, error_message, execution_time_ms, created_at, completed_at, updated_at, lease_expires_at, fencing_token
+	SELECT id, tenant_id, conversation_id, message_id, sequence_number, status, output_payload, error_message, execution_time_ms, created_at, completed_at, updated_at, lease_expires_at, fencing_token, attempt_count, max_attempts, next_retry_at, last_error, error_type
 	FROM processing_results
 	WHERE tenant_id = $1 AND conversation_id = $2 AND message_id = $3;
 	`
@@ -54,6 +56,11 @@ func (r *ResultsRepository) GetResult(ctx context.Context, tenantID, conversatio
 		&res.UpdatedAt,
 		&res.LeaseExpiresAt,
 		&res.FencingToken,
+		&res.AttemptCount,
+		&res.MaxAttempts,
+		&res.NextRetryAt,
+		&res.LastError,
+		&res.ErrorType,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -84,7 +91,6 @@ func (r *ResultsRepository) IsPrecedingSequenceCompleted(ctx context.Context, co
 	err := r.pool.QueryRow(ctx, query, conversationID, precedingSeq).Scan(&statusStr)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// A mensagem anterior ainda não foi nem concluída nem gravada
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to check preceding sequence completion: %w", err)
@@ -99,6 +105,7 @@ func (r *ResultsRepository) AcquireExecutionLockWithSeq(ctx context.Context, ten
 }
 
 // AcquireExecutionLockWithSeqAndFencing associa opcionalmente o fencing_token gerado pela coordenação à execução da mensagem.
+// Respeita estritamente o next_retry_at: se now < next_retry_at, a execução ainda não é elegível.
 func (r *ResultsRepository) AcquireExecutionLockWithSeqAndFencing(ctx context.Context, tenantID, conversationID, messageID string, sequenceNumber int64, leaseDuration time.Duration, fencingToken *int64) (*domain.ProcessingResult, error) {
 	if leaseDuration <= 0 {
 		leaseDuration = 30 * time.Second
@@ -113,10 +120,10 @@ func (r *ResultsRepository) AcquireExecutionLockWithSeqAndFencing(ctx context.Co
 
 	// Inserção atômica para nova execução
 	insertQuery := `
-	INSERT INTO processing_results (id, tenant_id, conversation_id, message_id, sequence_number, status, created_at, updated_at, lease_expires_at, fencing_token)
-	VALUES ($1, $2, $3, $4, $5, 'RUNNING', $6, $6, $7, $8)
+	INSERT INTO processing_results (id, tenant_id, conversation_id, message_id, sequence_number, status, created_at, updated_at, lease_expires_at, fencing_token, attempt_count, max_attempts)
+	VALUES ($1, $2, $3, $4, $5, 'RUNNING', $6, $6, $7, $8, 0, 5)
 	ON CONFLICT (tenant_id, conversation_id, message_id) DO NOTHING
-	RETURNING id, tenant_id, conversation_id, message_id, sequence_number, status, created_at, updated_at, lease_expires_at, fencing_token;
+	RETURNING id, tenant_id, conversation_id, message_id, sequence_number, status, created_at, updated_at, lease_expires_at, fencing_token, attempt_count, max_attempts, next_retry_at, last_error, error_type;
 	`
 
 	var res domain.ProcessingResult
@@ -132,6 +139,11 @@ func (r *ResultsRepository) AcquireExecutionLockWithSeqAndFencing(ctx context.Co
 		&res.UpdatedAt,
 		&res.LeaseExpiresAt,
 		&res.FencingToken,
+		&res.AttemptCount,
+		&res.MaxAttempts,
+		&res.NextRetryAt,
+		&res.LastError,
+		&res.ErrorType,
 	)
 
 	if err == nil {
@@ -153,16 +165,26 @@ func (r *ResultsRepository) AcquireExecutionLockWithSeqAndFencing(ctx context.Co
 			return nil, nil
 		}
 
+		// Se está em PENDING mas next_retry_at ainda é no futuro, não adquire o lock ainda
+		if existing.NextRetryAt != nil && existing.NextRetryAt.After(now) {
+			return nil, ErrExecutionLocked
+		}
+
 		if existing.Status == domain.ExecutionStatusRunning && existing.LeaseExpiresAt != nil && existing.LeaseExpiresAt.After(now) {
 			return nil, ErrExecutionLocked
 		}
 
+		// UPDATE condicional para retomar retry ou lease expirado
 		updateQuery := `
 		UPDATE processing_results
 		SET status = 'RUNNING', sequence_number = $1, updated_at = $2, lease_expires_at = $3, fencing_token = $4, error_message = NULL
 		WHERE tenant_id = $5 AND conversation_id = $6 AND message_id = $7
-		  AND (status = 'FAILED' OR (status = 'RUNNING' AND (lease_expires_at IS NULL OR lease_expires_at < $2)))
-		RETURNING id, tenant_id, conversation_id, message_id, sequence_number, status, created_at, updated_at, lease_expires_at, fencing_token;
+		  AND (
+		      status = 'FAILED' 
+		      OR (status = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= $2))
+		      OR (status = 'RUNNING' AND (lease_expires_at IS NULL OR lease_expires_at < $2))
+		  )
+		RETURNING id, tenant_id, conversation_id, message_id, sequence_number, status, created_at, updated_at, lease_expires_at, fencing_token, attempt_count, max_attempts, next_retry_at, last_error, error_type;
 		`
 
 		err = r.pool.QueryRow(ctx, updateQuery, sequenceNumber, now, leaseExpiresAt, fencingToken, tenantID, conversationID, messageID).Scan(
@@ -176,12 +198,17 @@ func (r *ResultsRepository) AcquireExecutionLockWithSeqAndFencing(ctx context.Co
 			&res.UpdatedAt,
 			&res.LeaseExpiresAt,
 			&res.FencingToken,
+			&res.AttemptCount,
+			&res.MaxAttempts,
+			&res.NextRetryAt,
+			&res.LastError,
+			&res.ErrorType,
 		)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, ErrExecutionLocked
 			}
-			return nil, fmt.Errorf("failed to take over expired/failed lease: %w", err)
+			return nil, fmt.Errorf("failed to take over retry/expired lease: %w", err)
 		}
 
 		res.Status = domain.ExecutionStatus(statusStr)
@@ -210,7 +237,6 @@ func (r *ResultsRepository) RecordExecutionSuccess(ctx context.Context, tenantID
 }
 
 // RecordExecutionSuccessWithFencing persiste o sucesso validando atomicamente o fencing_token (INV-04).
-// Se fencingToken > 0, garante que o fencing_token não foi superado por outro worker.
 func (r *ResultsRepository) RecordExecutionSuccessWithFencing(ctx context.Context, tenantID, conversationID, messageID string, output interface{}, executionTime time.Duration, fencingToken int64) error {
 	now := time.Now().UTC()
 	payloadBytes, err := json.Marshal(output)
@@ -224,7 +250,7 @@ func (r *ResultsRepository) RecordExecutionSuccessWithFencing(ctx context.Contex
 	if fencingToken > 0 {
 		query = `
 		UPDATE processing_results
-		SET status = 'SUCCEEDED', output_payload = $1, execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL, error_message = NULL
+		SET status = 'SUCCEEDED', output_payload = $1, execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL, next_retry_at = NULL, error_message = NULL
 		WHERE tenant_id = $4 AND conversation_id = $5 AND message_id = $6
 		  AND (fencing_token IS NULL OR fencing_token <= $7);
 		`
@@ -232,7 +258,7 @@ func (r *ResultsRepository) RecordExecutionSuccessWithFencing(ctx context.Contex
 	} else {
 		query = `
 		UPDATE processing_results
-		SET status = 'SUCCEEDED', output_payload = $1, execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL, error_message = NULL
+		SET status = 'SUCCEEDED', output_payload = $1, execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL, next_retry_at = NULL, error_message = NULL
 		WHERE tenant_id = $4 AND conversation_id = $5 AND message_id = $6;
 		`
 		args = []interface{}{payloadBytes, executionTime.Milliseconds(), now, tenantID, conversationID, messageID}
@@ -257,7 +283,7 @@ func (r *ResultsRepository) RecordExecutionFailure(ctx context.Context, tenantID
 	return r.RecordExecutionFailureWithFencing(ctx, tenantID, conversationID, messageID, failureErr, executionTime, 0)
 }
 
-// RecordExecutionFailureWithFencing registra a falha condicionado ao fencing_token.
+// RecordExecutionFailureWithFencing registra falha permanente.
 func (r *ResultsRepository) RecordExecutionFailureWithFencing(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, executionTime time.Duration, fencingToken int64) error {
 	now := time.Now().UTC()
 	var errText string
@@ -271,7 +297,7 @@ func (r *ResultsRepository) RecordExecutionFailureWithFencing(ctx context.Contex
 	if fencingToken > 0 {
 		query = `
 		UPDATE processing_results
-		SET status = 'FAILED', error_message = $1, execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL
+		SET status = 'FAILED', error_message = $1, last_error = $1, error_type = 'PERMANENT', execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL, next_retry_at = NULL
 		WHERE tenant_id = $4 AND conversation_id = $5 AND message_id = $6
 		  AND (fencing_token IS NULL OR fencing_token <= $7);
 		`
@@ -279,7 +305,7 @@ func (r *ResultsRepository) RecordExecutionFailureWithFencing(ctx context.Contex
 	} else {
 		query = `
 		UPDATE processing_results
-		SET status = 'FAILED', error_message = $1, execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL
+		SET status = 'FAILED', error_message = $1, last_error = $1, error_type = 'PERMANENT', execution_time_ms = $2, completed_at = $3, updated_at = $3, lease_expires_at = NULL, next_retry_at = NULL
 		WHERE tenant_id = $4 AND conversation_id = $5 AND message_id = $6;
 		`
 		args = []interface{}{errText, executionTime.Milliseconds(), now, tenantID, conversationID, messageID}
@@ -297,4 +323,74 @@ func (r *ResultsRepository) RecordExecutionFailureWithFencing(ctx context.Contex
 	}
 
 	return nil
+}
+
+// ScheduleRetry avalia se a falha é elegível para retry e agenda no banco (INV-05, INV-06).
+// Se for transitório e attempt < max_attempts: atualiza status para 'PENDING', calcula next_retry_at com backoff+jitter.
+// Se exceder max_attempts ou for permanente: marca status = 'FAILED'.
+// Retorna (scheduled=true, nextRetry, nil) se foi agendado; (scheduled=false, _, nil) se esgotou ou for permanente.
+func (r *ResultsRepository) ScheduleRetry(ctx context.Context, tenantID, conversationID, messageID string, failureErr error, baseBackoff, maxBackoff time.Duration) (bool, time.Time, error) {
+	now := time.Now().UTC()
+	var errText string
+	if failureErr != nil {
+		errText = failureErr.Error()
+	}
+
+	errType := retry.ClassifyError(failureErr)
+	isRetryable := errType == retry.ErrorTypeTransient
+
+	// 1. Busca registro atual para verificar attempt_count e max_attempts
+	existing, err := r.GetResult(ctx, tenantID, conversationID, messageID)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	if existing == nil {
+		return false, time.Time{}, fmt.Errorf("result not found for scheduling retry: msg %s", messageID)
+	}
+
+	nextAttempt := existing.AttemptCount + 1
+	if isRetryable && nextAttempt <= existing.MaxAttempts {
+		// Calcula backoff exponencial com Full Jitter
+		backoffDuration := retry.CalculateBackoff(nextAttempt, baseBackoff, maxBackoff)
+		nextRetryAt := now.Add(backoffDuration)
+
+		query := `
+		UPDATE processing_results
+		SET status = 'PENDING',
+		    attempt_count = $1,
+		    next_retry_at = $2,
+		    last_error = $3,
+		    error_type = $4,
+		    updated_at = $5,
+		    lease_expires_at = NULL
+		WHERE tenant_id = $6 AND conversation_id = $7 AND message_id = $8;
+		`
+		_, err := r.pool.Exec(ctx, query, nextAttempt, nextRetryAt, errText, string(errType), now, tenantID, conversationID, messageID)
+		if err != nil {
+			return false, time.Time{}, fmt.Errorf("failed to schedule retry in db: %w", err)
+		}
+
+		return true, nextRetryAt, nil
+	}
+
+	// Tentativas esgotadas ou erro permanente: marca como FAILED terminal
+	query := `
+	UPDATE processing_results
+	SET status = 'FAILED',
+	    attempt_count = $1,
+	    last_error = $2,
+	    error_message = $2,
+	    error_type = $3,
+	    completed_at = $4,
+	    updated_at = $4,
+	    lease_expires_at = NULL,
+	    next_retry_at = NULL
+	WHERE tenant_id = $5 AND conversation_id = $6 AND message_id = $7;
+	`
+	_, err = r.pool.Exec(ctx, query, nextAttempt, errText, string(errType), now, tenantID, conversationID, messageID)
+	if err != nil {
+		return false, time.Time{}, fmt.Errorf("failed to mark terminal failure in db: %w", err)
+	}
+
+	return false, time.Time{}, nil
 }

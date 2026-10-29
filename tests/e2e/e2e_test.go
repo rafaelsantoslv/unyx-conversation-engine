@@ -315,8 +315,8 @@ func TestE2E_FullPipeline(t *testing.T) {
 			t.Fatalf("failed to save msg: %v", err)
 		}
 
-		// Cria pipeline com MockRuntime que falha propositalmente
-		failErr := errors.New("simulated AI provider outage (503 Service Unavailable)")
+		// Cria pipeline com MockRuntime que falha propositalmente com erro permanente (400 Bad Request)
+		failErr := errors.New("simulated AI provider invalid payload (400 Bad Request)")
 		failingRuntime := mock.NewMockRuntime(mock.WithFailure(failErr))
 		failingPipeline := service.NewDefaultMessagePipelineHandler(failingRuntime, resultsRepo)
 
@@ -353,8 +353,9 @@ func TestE2E_FullPipeline(t *testing.T) {
 		if savedRes.Status != domain.ExecutionStatusFailed {
 			t.Errorf("expected status FAILED, got %s", savedRes.Status)
 		}
-		if savedRes.ErrorMessage == nil || !strings.Contains(*savedRes.ErrorMessage, "503") {
-			t.Errorf("expected error message with '503', got %v", savedRes.ErrorMessage)
+		if (savedRes.ErrorMessage == nil || !strings.Contains(*savedRes.ErrorMessage, "400")) &&
+			(savedRes.LastError == nil || !strings.Contains(*savedRes.LastError, "400")) {
+			t.Errorf("expected error message with '400', got error_message=%v, last_error=%v", savedRes.ErrorMessage, savedRes.LastError)
 		}
 	})
 

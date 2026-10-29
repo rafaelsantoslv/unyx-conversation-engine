@@ -3,6 +3,7 @@ package kafka_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -527,5 +528,155 @@ func TestConversationWorker_DistributedCoordination_Integration(t *testing.T) {
 	}
 	if res == nil || res.Status != domain.ExecutionStatusSucceeded {
 		t.Errorf("expected SUCCEEDED status in DB, got %+v", res)
+	}
+}
+
+type flappyMockRuntime struct {
+	mu            sync.Mutex
+	failCount     int
+	attemptsDone  int
+	successOutput *domain.ExecutionOutput
+}
+
+func (f *flappyMockRuntime) Execute(ctx context.Context, input domain.ExecutionInput) (*domain.ExecutionOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attemptsDone++
+	if f.attemptsDone <= f.failCount {
+		return nil, errors.New("503 Service Unavailable")
+	}
+	return f.successOutput, nil
+}
+
+func TestConversationWorker_RetryTransientFailure_Integration(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://postgres:postgres@localhost:5432/unyx_conversation?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	dbPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Skipf("skipping integration test: postgres connection failed: %v", err)
+		return
+	}
+	defer dbPool.Close()
+
+	if err := dbPool.Ping(ctx); err != nil {
+		t.Skipf("skipping integration test: postgres ping failed: %v", err)
+		return
+	}
+
+	repo := postgres.NewRepository(dbPool)
+	resultsRepo := postgres.NewResultsRepository(dbPool)
+
+	tenantID := fmt.Sprintf("tenant-retry-%d", time.Now().UnixNano())
+	extConvID := fmt.Sprintf("conv-retry-%d", time.Now().UnixNano())
+	conv, err := repo.GetOrCreateConversation(ctx, tenantID, extConvID)
+	if err != nil {
+		t.Fatalf("failed to create conversation: %v", err)
+	}
+
+	flappyRuntime := &flappyMockRuntime{
+		failCount: 2, // Falha nas 2 primeiras tentativas com 503, sucede na 3ª
+		successOutput: &domain.ExecutionOutput{
+			ResponseContent: "Recuperado após falhas transitórias com sucesso!",
+			TokensUsed:      42,
+			ExecutedAt:      time.Now().UTC(),
+		},
+	}
+
+	pipeline := service.NewDefaultMessagePipelineHandler(
+		flappyRuntime,
+		resultsRepo,
+		service.WithRetrySettings(50*time.Millisecond, 200*time.Millisecond),
+	)
+
+	msgID := uuid.New().String()
+	evt := domain.Event[domain.MessageReceivedPayload]{
+		EventID:        "evt-retry-e2e-1",
+		TenantID:       tenantID,
+		ConversationID: conv.ID,
+		EventType:      domain.EventTypeMessageReceived,
+		OccurredAt:     time.Now().UTC(),
+		Payload: domain.MessageReceivedPayload{
+			MessageID:         msgID,
+			ExternalMessageID: "ext-retry-1",
+			Channel:           "whatsapp",
+			Role:              domain.RoleUser,
+			Content:           "Mensagem que enfrentará 503 transitório",
+			SequenceNumber:    1,
+		},
+	}
+
+	// 1ª Tentativa -> Retorna erro 503, agenda retry durável no PostgreSQL com status PENDING
+	err1 := pipeline.HandleMessageReceived(ctx, evt)
+	if err1 == nil {
+		t.Fatalf("expected error on 1st attempt due to 503")
+	}
+
+	res1, err := resultsRepo.GetResult(ctx, tenantID, conv.ID, msgID)
+	if err != nil {
+		t.Fatalf("failed to get result after attempt 1: %v", err)
+	}
+	if res1.Status != domain.ExecutionStatusPending {
+		t.Errorf("expected status PENDING after transient failure, got %s", res1.Status)
+	}
+	if res1.AttemptCount != 1 {
+		t.Errorf("expected AttemptCount 1, got %d", res1.AttemptCount)
+	}
+	if res1.NextRetryAt == nil {
+		t.Fatalf("expected NextRetryAt to be set")
+	}
+
+	// Aguarda o tempo do backoff expirar
+	waitDuration := time.Until(*res1.NextRetryAt)
+	if waitDuration > 0 {
+		time.Sleep(waitDuration + 10*time.Millisecond)
+	}
+
+	// 2ª Tentativa -> Retorna erro 503 novamente
+	err2 := pipeline.HandleMessageReceived(ctx, evt)
+	if err2 == nil {
+		t.Fatalf("expected error on 2nd attempt due to 503")
+	}
+
+	res2, err := resultsRepo.GetResult(ctx, tenantID, conv.ID, msgID)
+	if err != nil {
+		t.Fatalf("failed to get result after attempt 2: %v", err)
+	}
+	if res2.Status != domain.ExecutionStatusPending {
+		t.Errorf("expected status PENDING after 2nd failure, got %s", res2.Status)
+	}
+	if res2.AttemptCount != 2 {
+		t.Errorf("expected AttemptCount 2, got %d", res2.AttemptCount)
+	}
+
+	// Aguarda o próximo backoff
+	waitDuration = time.Until(*res2.NextRetryAt)
+	if waitDuration > 0 {
+		time.Sleep(waitDuration + 10*time.Millisecond)
+	}
+
+	// 3ª Tentativa -> MockRuntime tem sucesso!
+	err3 := pipeline.HandleMessageReceived(ctx, evt)
+	if err3 != nil {
+		t.Fatalf("expected success on 3rd attempt, got: %v", err3)
+	}
+
+	res3, err := resultsRepo.GetResult(ctx, tenantID, conv.ID, msgID)
+	if err != nil {
+		t.Fatalf("failed to get result after attempt 3: %v", err)
+	}
+	if res3.Status != domain.ExecutionStatusSucceeded {
+		t.Errorf("expected status SUCCEEDED after 3rd attempt, got %s", res3.Status)
+	}
+	if res3.AttemptCount != 2 { // AttemptCount incrementa nas falhas
+		t.Logf("final attempt count: %d", res3.AttemptCount)
+	}
+	if flappyRuntime.attemptsDone != 3 {
+		t.Errorf("expected exactly 3 attempts executed on runtime, got %d", flappyRuntime.attemptsDone)
 	}
 }

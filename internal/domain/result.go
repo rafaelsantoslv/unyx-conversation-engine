@@ -8,6 +8,7 @@ import (
 type ExecutionStatus string
 
 const (
+	ExecutionStatusPending   ExecutionStatus = "PENDING"
 	ExecutionStatusRunning   ExecutionStatus = "RUNNING"
 	ExecutionStatusSucceeded ExecutionStatus = "SUCCEEDED"
 	ExecutionStatusFailed    ExecutionStatus = "FAILED"
@@ -15,7 +16,7 @@ const (
 
 func (s ExecutionStatus) IsValid() bool {
 	switch s {
-	case ExecutionStatusRunning, ExecutionStatusSucceeded, ExecutionStatusFailed:
+	case ExecutionStatusPending, ExecutionStatusRunning, ExecutionStatusSucceeded, ExecutionStatusFailed:
 		return true
 	default:
 		return false
@@ -38,4 +39,9 @@ type ProcessingResult struct {
 	UpdatedAt       time.Time       `json:"updated_at"`
 	LeaseExpiresAt  *time.Time      `json:"lease_expires_at,omitempty"`
 	FencingToken    *int64          `json:"fencing_token,omitempty"`
+	AttemptCount    int             `json:"attempt_count"`
+	MaxAttempts     int             `json:"max_attempts"`
+	NextRetryAt     *time.Time      `json:"next_retry_at,omitempty"`
+	LastError       *string         `json:"last_error,omitempty"`
+	ErrorType       *string         `json:"error_type,omitempty"`
 }
