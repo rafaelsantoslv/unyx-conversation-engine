@@ -139,12 +139,13 @@ func (r *OutboundIntentsRepository) ClaimPendingIntents(ctx context.Context, lim
 	selectQuery := `
 	SELECT id, tenant_id, conversation_id, execution_id, payload, status, attempts, max_attempts, next_retry_at, external_message_id, error_message, created_at, updated_at
 	FROM outbound_intents
-	WHERE (status = 'PENDING' OR (status = 'FAILED' AND attempts < max_attempts))
+	WHERE (status = 'PENDING' OR (status IN ('FAILED', 'UNKNOWN') AND attempts < max_attempts))
 	  AND (next_retry_at IS NULL OR next_retry_at <= $1)
 	ORDER BY created_at ASC
 	LIMIT $2
 	FOR UPDATE SKIP LOCKED;
 	`
+
 	rows, err := tx.Query(ctx, selectQuery, now, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to select pending intents: %w", err)
@@ -235,3 +236,17 @@ func (r *OutboundIntentsRepository) MarkCancelled(ctx context.Context, intentID 
 	_, err := r.pool.Exec(ctx, query, reason, now, intentID)
 	return err
 }
+
+// MarkUnknown marca o envio como UNKNOWN (ambíguo após timeout/queda de rede sem resposta) agendando reconciliação (INV-08).
+func (r *OutboundIntentsRepository) MarkUnknown(ctx context.Context, intentID string, errReason string, retryAfter time.Duration) error {
+	now := time.Now().UTC()
+	nextRetry := now.Add(retryAfter)
+	query := `
+	UPDATE outbound_intents
+	SET status = 'UNKNOWN', error_message = $1, next_retry_at = $2, updated_at = $3
+	WHERE id = $4;
+	`
+	_, err := r.pool.Exec(ctx, query, errReason, nextRetry, now, intentID)
+	return err
+}
+

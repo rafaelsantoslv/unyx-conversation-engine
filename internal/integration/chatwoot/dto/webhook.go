@@ -61,19 +61,32 @@ type ChatwootInbox struct {
 
 // ChatwootSendRequestDTO define o payload HTTP para enviar mensagens via API do Chatwoot.
 type ChatwootSendRequestDTO struct {
-	Content     string `json:"content"`
-	MessageType string `json:"message_type,omitempty"` // "outgoing"
-	Private     bool   `json:"private,omitempty"`
+	Content           string                 `json:"content"`
+	MessageType       string                 `json:"message_type,omitempty"` // "outgoing"
+	Private           bool                   `json:"private,omitempty"`
+	EchoID            string                 `json:"echo_id,omitempty"`
+	ContentAttributes map[string]interface{} `json:"content_attributes,omitempty"`
 }
 
 // ChatwootSendResponseDTO define a resposta da API do Chatwoot ao criar mensagem.
 type ChatwootSendResponseDTO struct {
-	ID          int64  `json:"id"`
-	Content     string `json:"content"`
-	MessageType string `json:"message_type"`
-	CreatedAt   int64  `json:"created_at"`
-	ConversationID int64 `json:"conversation_id"`
+	ID                int64                  `json:"id"`
+	Content           string                 `json:"content"`
+	MessageType       interface{}            `json:"message_type"` // int (1) ou string ("outgoing")
+	CreatedAt         int64                  `json:"created_at"`
+	ConversationID    int64                  `json:"conversation_id"`
+	EchoID            string                 `json:"echo_id,omitempty"`
+	ContentAttributes map[string]interface{} `json:"content_attributes,omitempty"`
 }
+
+// ChatwootMessagesListResponseDTO define a resposta da API GET /conversations/{id}/messages.
+type ChatwootMessagesListResponseDTO struct {
+	Meta struct {
+		AllCount int `json:"all_count"`
+	} `json:"meta"`
+	Payload []ChatwootSendResponseDTO `json:"payload"`
+}
+
 
 // MapChatwootChannelType mapeia os tipos de canais proprietários do Chatwoot para o ChannelType canônico.
 func MapChatwootChannelType(inboxChannelType string) ports.ChannelType {

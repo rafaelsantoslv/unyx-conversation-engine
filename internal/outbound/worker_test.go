@@ -177,4 +177,117 @@ func TestOutboundWorker_DispatchAndResilience(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, domain.OutboundStatusCancelled, saved.Status)
 	})
+
+	t.Run("Reconciles ambiguous intent on network timeout and avoids duplicate sending (INV-08)", func(t *testing.T) {
+		// Reabre a conversa para AI_ACTIVE
+		c, err := coreRepo.GetConversationByID(ctx, conv.ID)
+		require.NoError(t, err)
+		_, err = coreRepo.TransitionConversationState(
+			ctx, tenantID, conv.ID, domain.StateAIActive, c.Version, "reopen for bot", "system",
+		)
+		require.NoError(t, err)
+
+		messagesStore := make([]cwDto.ChatwootSendResponseDTO, 0)
+		postCount := 0
+		getCount := 0
+
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == http.MethodPost {
+				postCount++
+				var body cwDto.ChatwootSendRequestDTO
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				msgID := int64(889900)
+				messagesStore = append(messagesStore, cwDto.ChatwootSendResponseDTO{
+					ID:                msgID,
+					Content:           body.Content,
+					MessageType:       "outgoing",
+					CreatedAt:         time.Now().Unix(),
+					ConversationID:    5566,
+					EchoID:            body.EchoID,
+					ContentAttributes: body.ContentAttributes,
+				})
+
+				// Simula timeout da conexão logo após persistir no Chatwoot (Two Generals' Problem)
+				hj, ok := w.(http.Hijacker)
+				if ok {
+					conn, _, _ := hj.Hijack()
+					conn.Close() // Fecha o socket TCP abruptamente sem enviar resposta HTTP!
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			if r.Method == http.MethodGet {
+				getCount++
+				var listResp cwDto.ChatwootMessagesListResponseDTO
+				listResp.Payload = messagesStore
+				listResp.Meta.AllCount = len(messagesStore)
+				_ = json.NewEncoder(w).Encode(listResp)
+				return
+			}
+		}))
+		defer mockServer.Close()
+
+		// Atualiza URL do tenant
+		err = integrationRepo.UpsertIntegration(ctx, postgres.TenantIntegration{
+			TenantID:       tenantID,
+			Channel:        "chatwoot",
+			WebhookToken:   "token-123",
+			APIURL:         mockServer.URL,
+			APIAccessToken: "chatwoot-secret-token",
+			IsActive:       true,
+		})
+		require.NoError(t, err)
+
+		execID := uuid.New().String()
+		intent := domain.OutboundIntent{
+			TenantID:       tenantID,
+			ConversationID: conv.ID,
+			ExecutionID:    execID,
+			Payload: domain.OutboundPayload{
+				Content: "Mensagem sujeita a timeout e reconciliação!",
+			},
+		}
+		_, err = outboundRepo.CreateIntent(ctx, intent)
+		require.NoError(t, err)
+
+		sender := chatwoot.NewChatwootOutboundSender(mockServer.Client())
+		workerSvc := outbound.NewOutboundWorkerService(
+			outboundRepo,
+			integrationRepo,
+			mappingRepo,
+			coreRepo,
+			sender,
+		)
+
+		// 1ª Rodada: Faz POST, servidor fecha conexão TCP abruptamente -> Worker detecta queda e marca como UNKNOWN
+		processed, err := workerSvc.ProcessBatch(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, processed)
+		assert.Equal(t, 1, postCount, "Deve ter tentado enviar uma vez")
+
+		saved, err := outboundRepo.GetIntentByExecutionID(ctx, tenantID, execID)
+		require.NoError(t, err)
+		assert.Equal(t, domain.OutboundStatusUnknown, saved.Status, "Deve ter transitado para UNKNOWN após timeout")
+
+		// 2ª Rodada: Próximo ciclo do worker -> Como está em UNKNOWN, consulta GET /messages primeiro!
+		// Força next_retry_at para o passado para permitir claim imediato
+		_, err = pool.Exec(ctx, "UPDATE outbound_intents SET next_retry_at = NOW() - INTERVAL '1 second' WHERE id = $1", saved.ID)
+		require.NoError(t, err)
+
+		processed2, err := workerSvc.ProcessBatch(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, processed2)
+		assert.Equal(t, 1, postCount, "NÃO deve ter feito outro POST (evitou mensagem duplicada no WhatsApp!)")
+		assert.Equal(t, 1, getCount, "Deve ter consultado o histórico via GET para reconciliação")
+
+		saved2, err := outboundRepo.GetIntentByExecutionID(ctx, tenantID, execID)
+		require.NoError(t, err)
+		assert.Equal(t, domain.OutboundStatusSent, saved2.Status, "Deve ter sido reconciliado e marcado como SENT")
+		require.NotNil(t, saved2.ExternalMessageID)
+		assert.Equal(t, "889900", *saved2.ExternalMessageID)
+	})
 }
+
