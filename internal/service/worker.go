@@ -43,6 +43,12 @@ type DebounceRepository interface {
 	MarkWindowProcessed(ctx context.Context, conversationID string) error
 }
 
+// ExecutionSchedulerRepository define o contrato para persistência e agendamento durável no PostgreSQL.
+type ExecutionSchedulerRepository interface {
+	ScheduleExecution(ctx context.Context, tenantID, conversationID string, scheduledFor time.Time) (*domain.ConversationSchedule, error)
+	CancelSchedule(ctx context.Context, conversationID string) error
+}
+
 // ConversationCoordinator define o contrato para coordenação distribuída entre múltiplos workers (INV-02, INV-04, INV-08).
 type ConversationCoordinator interface {
 	AcquireExecution(ctx context.Context, tenantID, conversationID, workerID string, leaseDuration time.Duration) (*domain.ConversationExecution, error)
@@ -58,6 +64,7 @@ type DefaultMessagePipelineHandler struct {
 	resultsRepo       ResultsRepository
 	coordinator       ConversationCoordinator
 	debounceRepo      DebounceRepository
+	scheduleRepo      ExecutionSchedulerRepository
 	debounceCfg       domain.DebounceConfig
 	workerID          string
 	leaseTime         time.Duration
@@ -91,6 +98,12 @@ func WithDebounce(repo DebounceRepository, cfg domain.DebounceConfig) PipelineOp
 	return func(h *DefaultMessagePipelineHandler) {
 		h.debounceRepo = repo
 		h.debounceCfg = cfg
+	}
+}
+
+func WithScheduler(repo ExecutionSchedulerRepository) PipelineOption {
+	return func(h *DefaultMessagePipelineHandler) {
+		h.scheduleRepo = repo
 	}
 }
 
@@ -197,6 +210,15 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 			log.Printf("[pipeline] warning: failed to register/extend debounce window: %v", err)
 		} else if window != nil {
 			now := time.Now().UTC()
+
+			// Se tiver repositório de agendamento durável configurado, registra/atualiza o agendamento no PostgreSQL (INV-03, INV-05)
+			if h.scheduleRepo != nil {
+				_, schedErr := h.scheduleRepo.ScheduleExecution(ctx, tenantID, convID, window.DebounceUntil)
+				if schedErr != nil {
+					log.Printf("[pipeline] warning: failed to persist durable schedule for conversation %s: %v", convID, schedErr)
+				}
+			}
+
 			if !window.IsReady(now) {
 				// Aguarda a janela de inatividade fechar ou teto máximo ser atingido (Sliding Window)
 				waitDuration := time.Until(window.DebounceUntil)
