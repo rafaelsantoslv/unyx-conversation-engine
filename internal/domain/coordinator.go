@@ -25,4 +25,7 @@ type ConversationExecution struct {
 	ReleasedAt     *time.Time      `json:"released_at,omitempty"`
 	ExpiresAt      time.Time       `json:"expires_at"`
 	FencingToken   int64           `json:"fencing_token"`
+	AttemptCount   int             `json:"attempt_count"`
+	MaxAttempts    int             `json:"max_attempts"`
+	UpdatedAt      time.Time       `json:"updated_at"`
 }

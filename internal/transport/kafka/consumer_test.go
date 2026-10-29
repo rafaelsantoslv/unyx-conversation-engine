@@ -18,6 +18,7 @@ import (
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/service"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/storage/postgres"
 	transkafka "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/kafka"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/worker"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -813,5 +814,86 @@ func TestConversationWorker_PoisonPillQuarantine_Integration(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected 1 quarantined event in db, got %d", count)
+	}
+}
+
+func TestConversationWorker_OrphanReconciler_Integration(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://postgres:postgres@localhost:5432/unyx_conversation?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	dbPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Skipf("skipping integration test: postgres connection failed: %v", err)
+		return
+	}
+	defer dbPool.Close()
+
+	if err := dbPool.Ping(ctx); err != nil {
+		t.Skipf("skipping integration test: postgres ping failed: %v", err)
+		return
+	}
+
+	repo := postgres.NewRepository(dbPool)
+	resultsRepo := postgres.NewResultsRepository(dbPool)
+	coordinator := postgres.NewExecutionCoordinator(dbPool)
+
+	tenantID := fmt.Sprintf("tenant-reconcile-%d", time.Now().UnixNano())
+	extConvID := fmt.Sprintf("conv-reconcile-%d", time.Now().UnixNano())
+	conv, err := repo.GetOrCreateConversation(ctx, tenantID, extConvID)
+	if err != nil {
+		t.Fatalf("failed to create conv: %v", err)
+	}
+
+	// 1. Worker 1 adquire a execução da conversa e "morre" (crash)
+	crashedExec, err := coordinator.AcquireExecution(ctx, tenantID, conv.ID, "worker-crashed", 1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to acquire initial execution: %v", err)
+	}
+	initialToken := crashedExec.FencingToken
+
+	// Simula que a execução expirou (worker morreu sem liberar o lease)
+	_, err = dbPool.Exec(ctx, "UPDATE conversation_executions SET expires_at = NOW() - INTERVAL '5 seconds' WHERE id = $1", crashedExec.ID)
+	if err != nil {
+		t.Fatalf("failed to expire lease: %v", err)
+	}
+
+	// 2. Novo Worker 2 tenta processar evento dessa conversa antes da reconciliação (conversa seria liberada pelo novo fencing)
+	// Inicializa o Reconciliador
+	reconciler := worker.NewExecutionReconciler(
+		coordinator,
+		resultsRepo,
+		worker.ExecutionReconcilerConfig{
+			BatchSize: 10,
+		},
+	)
+
+	// Dispara uma rodada de reconciliação
+	count, err := reconciler.ReconcileOnce(ctx)
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+	if count == 0 {
+		t.Fatalf("expected at least 1 orphan execution to be reconciled, got 0")
+	}
+
+	// 3. Worker 2 assume a conversa com sucesso
+	worker2Exec, err := coordinator.AcquireExecution(ctx, tenantID, conv.ID, "worker-node-2", 10*time.Second)
+	if err != nil {
+		t.Fatalf("worker 2 should be able to acquire reconciled conversation: %v", err)
+	}
+
+	if worker2Exec.FencingToken <= initialToken {
+		t.Errorf("worker 2 fencing token (%d) must be greater than crashed token (%d)", worker2Exec.FencingToken, initialToken)
+	}
+
+	// 4. Worker 1 acorda do limbo e tenta renovar ou liberar: deve ser REJEITADO (INV-04)
+	errZombie := coordinator.RenewLease(ctx, crashedExec.ID, initialToken, 5*time.Second)
+	if !errors.Is(errZombie, domain.ErrFencingTokenStale) {
+		t.Errorf("expected ErrFencingTokenStale for crashed worker 1, got %v", errZombie)
 	}
 }

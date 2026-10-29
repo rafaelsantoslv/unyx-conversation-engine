@@ -99,8 +99,13 @@ func CalculateBackoff(attempt int, baseBackoff, maxBackoff time.Duration) time.D
 		tempMax = maxBackoff
 	}
 
-	// Full Jitter aleatório no intervalo [0, tempMax]
-	jitterNs := secureRandomInt64(tempMax.Nanoseconds() + 1)
+	// Full Jitter aleatório no intervalo [baseBackoff/2, tempMax] para sempre garantir um avanço no tempo
+	minJitter := (baseBackoff / 2).Nanoseconds()
+	rangeSpan := tempMax.Nanoseconds() - minJitter
+	if rangeSpan <= 0 {
+		return baseBackoff
+	}
+	jitterNs := minJitter + secureRandomInt64(rangeSpan+1)
 	return time.Duration(jitterNs)
 }
 

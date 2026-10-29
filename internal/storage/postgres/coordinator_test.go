@@ -202,4 +202,49 @@ func TestExecutionCoordinator_Integration(t *testing.T) {
 			t.Fatalf("worker 2 failed to release with valid token: %v", err)
 		}
 	})
+
+	t.Run("reconciles orphan execution with expired lease (INV-04, INV-05)", func(t *testing.T) {
+		orphanConv, err := repo.GetOrCreateConversation(ctx, tenantID, "conv-orphan-test")
+		if err != nil {
+			t.Fatalf("failed to create conv: %v", err)
+		}
+
+		// Adquire execução com worker-crashed
+		exec, err := coordinator.AcquireExecution(ctx, tenantID, orphanConv.ID, "worker-crashed", 1*time.Second)
+		if err != nil {
+			t.Fatalf("failed to acquire execution: %v", err)
+		}
+
+		// Simula crash forçando lease expirado no banco
+		_, err = pool.Exec(ctx, "UPDATE conversation_executions SET expires_at = NOW() - INTERVAL '10 seconds' WHERE id = $1", exec.ID)
+		if err != nil {
+			t.Fatalf("failed to expire lease: %v", err)
+		}
+
+		// Reconcilia
+		reconciled, err := coordinator.ReconcileOrphanExecutions(ctx, 10)
+		if err != nil {
+			t.Fatalf("failed to reconcile: %v", err)
+		}
+
+		var found bool
+		for _, r := range reconciled {
+			if r.ID == exec.ID {
+				found = true
+				if r.FencingToken != exec.FencingToken+1 {
+					t.Errorf("expected fencing token incremented from %d to %d, got %d", exec.FencingToken, exec.FencingToken+1, r.FencingToken)
+				}
+				if r.AttemptCount != 2 {
+					t.Errorf("expected attempt_count 2, got %d", r.AttemptCount)
+				}
+				if r.IsQuarantined {
+					t.Errorf("should not be quarantined yet on attempt 2")
+				}
+			}
+		}
+
+		if !found {
+			t.Fatalf("expected orphan execution %s to be reconciled", exec.ID)
+		}
+	})
 }

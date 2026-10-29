@@ -17,6 +17,7 @@ import (
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/service"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/storage/postgres"
 	transkafka "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/kafka"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/worker"
 )
 
 func main() {
@@ -70,7 +71,26 @@ func main() {
 		resultsRepo,
 		service.WithCoordinator(coordinator, workerID),
 	)
-	workerService := service.NewConversationWorkerService(kafkaConsumer, pipelineHandler)
+	workerService := service.NewConversationWorkerService(
+		kafkaConsumer,
+		pipelineHandler,
+		service.WithWorkerResultsRepo(resultsRepo),
+	)
+
+	// 4. Inicializa Reconciliador de Execuções Órfãs em background (INV-04, INV-05)
+	reconciler := worker.NewExecutionReconciler(
+		coordinator,
+		resultsRepo,
+		worker.ExecutionReconcilerConfig{
+			PollInterval: 15 * time.Second,
+			BatchSize:    20,
+		},
+	)
+	go func() {
+		if err := reconciler.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("execution reconciler stopped with error: %v", err)
+		}
+	}()
 
 	// 4. Servidor HTTP de Health Check e Liveness
 	mux := http.NewServeMux()
