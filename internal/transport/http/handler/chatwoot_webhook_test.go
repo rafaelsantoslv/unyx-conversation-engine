@@ -114,7 +114,7 @@ func TestChatwootWebhookHandler_AuthenticationAndIngestion(t *testing.T) {
 
 		webhookHandler.HandleWebhook(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Body.String(), "echo_prevented")
+		assert.Contains(t, w.Body.String(), "echo_loop_prevented")
 		assert.Equal(t, countBefore, len(mockIngestion.ingested), "Echoes must NOT be ingested into engine pipeline")
 	})
 

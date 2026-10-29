@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/integration/chatwoot"
 	cwDto "github.com/rafaelsantoslv/unyx-conversation-engine/internal/integration/chatwoot/dto"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/integration/ports"
 	transporthttp "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/http"
@@ -20,15 +21,33 @@ type WebhookAuthValidator interface {
 	ValidateWebhookToken(ctx context.Context, tenantID, channel, token string) (bool, error)
 }
 
+type WebhookMessageClassifier interface {
+	ClassifyMessage(ctx context.Context, tenantID string, payload *cwDto.ChatwootWebhookPayload) (chatwoot.MessageClassification, string)
+}
+
 type ChatwootWebhookHandler struct {
 	ingestionSvc  IngestionService
 	authValidator WebhookAuthValidator
+	classifier    WebhookMessageClassifier
 }
 
-func NewChatwootWebhookHandler(ingestionSvc IngestionService, authValidator WebhookAuthValidator) *ChatwootWebhookHandler {
-	return &ChatwootWebhookHandler{
+func NewChatwootWebhookHandler(ingestionSvc IngestionService, authValidator WebhookAuthValidator, opts ...WebhookOption) *ChatwootWebhookHandler {
+	h := &ChatwootWebhookHandler{
 		ingestionSvc:  ingestionSvc,
 		authValidator: authValidator,
+		classifier:    chatwoot.NewEventClassifier(nil),
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
+}
+
+type WebhookOption func(*ChatwootWebhookHandler)
+
+func WithMessageClassifier(classifier WebhookMessageClassifier) WebhookOption {
+	return func(h *ChatwootWebhookHandler) {
+		h.classifier = classifier
 	}
 }
 
@@ -93,14 +112,32 @@ func (h *ChatwootWebhookHandler) HandleWebhook(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 3. Normalização e Anti-Corruption Layer (ACL)
+	// 3. Classificação de Eventos e Prevenção Rigorosa de Loops (INV-03, INV-05)
+	if h.classifier != nil {
+		classification, reason := h.classifier.ClassifyMessage(r.Context(), tenantID, &cwPayload)
+		if classification == chatwoot.ClassificationBotEcho {
+			log.Printf("[webhook] echo loop prevented for tenant %s, msg %d: %s", tenantID, cwPayload.ID, reason)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ignored","reason":"echo_loop_prevented"}`))
+			return
+		}
+		if classification == chatwoot.ClassificationIgnored {
+			log.Printf("[webhook] ignored message for tenant %s, msg %d: %s", tenantID, cwPayload.ID, reason)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ignored","reason":"non_actionable_event"}`))
+			return
+		}
+	}
+
+	// 4. Normalização e Anti-Corruption Layer (ACL)
 	canonicalEvt, err := cwPayload.ToCanonicalProviderEvent(tenantID)
 	if err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, "mapping error", err.Error(), reqID)
 		return
 	}
 
-	// Se não for evento de mensagem (ou for irrelevante/ignorado, como echoes de agentes), responde 200 OK sem disparar pipeline
 	if canonicalEvt.Type != ports.ProviderEventMessageCreated || canonicalEvt.IncomingMessage == nil {
 		log.Printf("[webhook] ignored non-actionable chatwoot event: type=%s, event=%s", canonicalEvt.Type, cwPayload.Event)
 		w.Header().Set("Content-Type", "application/json")
@@ -109,16 +146,7 @@ func (h *ChatwootWebhookHandler) HandleWebhook(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Prevenção de loop/eco de mensagem enviada pelo próprio bot/agente (INV-03)
-	if canonicalEvt.IncomingMessage.IsEcho {
-		log.Printf("[webhook] echo prevented for msg %s: outgoing/agent message ignored", canonicalEvt.IncomingMessage.ExternalMessageID)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ignored","reason":"echo_prevented"}`))
-		return
-	}
-
-	// 4. Ingestão assíncrona no IngestionService com Transactional Outbox (INV-02)
+	// 5. Ingestão assíncrona no IngestionService com Transactional Outbox (INV-02)
 	ingestReq := dto.IngestMessageRequest{
 		TenantID:          canonicalEvt.TenantID,
 		ConversationID:    canonicalEvt.IncomingMessage.ExternalConversationID,
