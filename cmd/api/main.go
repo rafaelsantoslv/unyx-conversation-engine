@@ -39,8 +39,10 @@ func main() {
 	}
 
 	repo := postgres.NewRepository(dbPool)
+	integrationRepo := postgres.NewIntegrationRepository(dbPool)
 	ingestionSvc := service.NewIngestionService(repo)
 	msgHandler := handler.NewMessageHandler(ingestionSvc)
+	chatwootHandler := handler.NewChatwootWebhookHandler(ingestionSvc, integrationRepo)
 
 	mux := http.NewServeMux()
 
@@ -63,6 +65,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/messages", msgHandler.HandleIngest)
+	mux.HandleFunc("/v1/integrations/chatwoot/webhooks/", chatwootHandler.HandleWebhook)
 
 	handlerWithMiddlewares := transporthttp.RequestIDMiddleware(
 		transporthttp.LoggingMiddleware(mux),
