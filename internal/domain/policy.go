@@ -7,13 +7,28 @@ import (
 
 // ConversationPolicy define as regras de parametrização de atendimento por tenant, canal ou agente (INV-09).
 type ConversationPolicy struct {
-	TenantID             string        `json:"tenant_id"`
-	Channel              string        `json:"channel"`
-	AllowAIProcessing    bool          `json:"allow_ai_processing"`
-	HandoffKeywordPrefix string        `json:"handoff_keyword_prefix,omitempty"`
-	InactivityTimeout    time.Duration `json:"inactivity_timeout"`
-	MaxDailySessions     int           `json:"max_daily_sessions"`
-	BusinessHoursOnly    bool          `json:"business_hours_only"`
+	TenantID                  string        `json:"tenant_id"`
+	Channel                   string        `json:"channel,omitempty"`
+	DebounceEnabled           bool          `json:"debounce_enabled"`
+	DebounceInactivitySeconds int           `json:"debounce_inactivity_seconds"`
+	MaxWaitSeconds            int           `json:"max_wait_seconds"`
+	AllowAIProcessing         bool          `json:"allow_ai_processing"`
+	HandoffKeywordPrefix      string        `json:"handoff_keyword_prefix,omitempty"`
+	InactivityTimeout         time.Duration `json:"inactivity_timeout"`
+	MaxDailySessions          int           `json:"max_daily_sessions,omitempty"`
+	BusinessHoursOnly         bool          `json:"business_hours_only,omitempty"`
+}
+
+// DefaultPolicy retorna a política segura de fábrica caso o tenant não possua configuração customizada.
+func DefaultPolicy(tenantID string) ConversationPolicy {
+	return ConversationPolicy{
+		TenantID:                  tenantID,
+		DebounceEnabled:           true,
+		DebounceInactivitySeconds: 3,
+		MaxWaitSeconds:            15,
+		AllowAIProcessing:         true,
+		InactivityTimeout:         24 * time.Hour,
+	}
 }
 
 // ConversationPolicyResolver desacopla o motor de regras de negócio específicas de canal ou tenant.

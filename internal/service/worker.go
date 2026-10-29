@@ -57,6 +57,11 @@ type ExecutionRequestSnapshotRepository interface {
 	UpdateStatus(ctx context.Context, id string, status domain.ExecutionRequestStatus) error
 }
 
+// TenantPolicyResolver define a resolução desacoplada de configurações e políticas por tenant (INV-09).
+type TenantPolicyResolver interface {
+	ResolvePolicy(ctx context.Context, tenantID, channel string) (*domain.ConversationPolicy, error)
+}
+
 // ConversationCoordinator define o contrato para coordenação distribuída entre múltiplos workers (INV-02, INV-04, INV-08).
 type ConversationCoordinator interface {
 	AcquireExecution(ctx context.Context, tenantID, conversationID, workerID string, leaseDuration time.Duration) (*domain.ConversationExecution, error)
@@ -75,6 +80,7 @@ type DefaultMessagePipelineHandler struct {
 	debounceRepo      DebounceRepository
 	scheduleRepo      ExecutionSchedulerRepository
 	execReqRepo       ExecutionRequestSnapshotRepository
+	policyResolver    TenantPolicyResolver
 	debounceCfg       domain.DebounceConfig
 	workerID          string
 	leaseTime         time.Duration
@@ -123,6 +129,12 @@ func WithExecutionRequestRepository(repo ExecutionRequestSnapshotRepository) Pip
 	}
 }
 
+func WithPolicyResolver(resolver TenantPolicyResolver) PipelineOption {
+	return func(h *DefaultMessagePipelineHandler) {
+		h.policyResolver = resolver
+	}
+}
+
 func WithRetrySettings(baseBackoff, maxBackoff time.Duration) PipelineOption {
 	return func(h *DefaultMessagePipelineHandler) {
 		if baseBackoff > 0 {
@@ -163,7 +175,26 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 	msgID := evt.Payload.MessageID
 	seqNumber := evt.Payload.SequenceNumber
 
-	// 1. Controle de Idempotência e Concorrência Atômica via PostgreSQL
+	// 1. Resolução Dinâmica de Políticas por Tenant (INV-09)
+	effectiveDebounceCfg := h.debounceCfg
+	if h.policyResolver != nil {
+		if pol, polErr := h.policyResolver.ResolvePolicy(ctx, tenantID, evt.Payload.Channel); polErr == nil && pol != nil {
+			if !pol.AllowAIProcessing {
+				log.Printf("[pipeline] tenant policy disallows AI processing for tenant %s. Skipping execution.", tenantID)
+				return nil
+			}
+			if pol.DebounceEnabled {
+				effectiveDebounceCfg = domain.DebounceConfig{
+					InactivityWindow: time.Duration(pol.DebounceInactivitySeconds) * time.Second,
+					MaxWaitTimeout:   time.Duration(pol.MaxWaitSeconds) * time.Second,
+				}
+			} else {
+				effectiveDebounceCfg = domain.DebounceConfig{InactivityWindow: 0, MaxWaitTimeout: 0}
+			}
+		}
+	}
+
+	// 2. Controle de Idempotência e Concorrência Atômica via PostgreSQL
 	if h.resultsRepo != nil {
 		// Checagem prévia rápida de idempotência
 		existing, err := h.resultsRepo.GetResult(ctx, tenantID, convID, msgID)
@@ -178,7 +209,7 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 			return nil
 		}
 
-		// 2. Garantia de Ordenação Sequencial Estrita (INV-02):
+		// Garantia de Ordenação Sequencial Estrita (INV-02):
 		// Se seqNumber > 1, a mensagem N só pode ser processada após a mensagem N-1 estar SUCCEEDED.
 		if seqNumber > 1 {
 			maxWait := 10 * time.Second
@@ -219,9 +250,9 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 		}
 	}
 
-	// 3. Gestão Durável de Debounce / Sliding Inactivity Window (INV-01, INV-02, INV-10)
-	if h.debounceRepo != nil && h.debounceCfg.InactivityWindow > 0 {
-		window, err := h.debounceRepo.RegisterOrExtendWindow(ctx, tenantID, convID, h.debounceCfg)
+	// 3. Gestão Durável de Debounce (INV-01, INV-02, INV-10)
+	if h.debounceRepo != nil && effectiveDebounceCfg.InactivityWindow > 0 {
+		window, err := h.debounceRepo.RegisterOrExtendWindow(ctx, tenantID, convID, effectiveDebounceCfg)
 		if err != nil {
 			log.Printf("[pipeline] warning: failed to register/extend debounce window: %v", err)
 		} else if window != nil {
