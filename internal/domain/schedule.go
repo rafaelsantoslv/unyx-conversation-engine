@@ -40,10 +40,13 @@ type ConversationSchedule struct {
 
 // ExecutionReadyPayload representa o payload emitido quando o agendamento dispara e está pronto para o worker.
 type ExecutionReadyPayload struct {
-	ConversationID string    `json:"conversation_id"`
-	TenantID       string    `json:"tenant_id"`
-	TriggeredAt    time.Time `json:"triggered_at"`
-	Reason         string    `json:"reason"`
+	ExecutionRequestID string    `json:"execution_request_id,omitempty"`
+	ConversationID     string    `json:"conversation_id"`
+	TenantID           string    `json:"tenant_id"`
+	WatermarkSequence  int64     `json:"watermark_sequence,omitempty"`
+	MessageIDs         []string  `json:"message_ids,omitempty"`
+	TriggeredAt        time.Time `json:"triggered_at"`
+	Reason             string    `json:"reason"`
 }
 
 var (

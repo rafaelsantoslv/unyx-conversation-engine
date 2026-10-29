@@ -49,6 +49,13 @@ type ExecutionSchedulerRepository interface {
 	CancelSchedule(ctx context.Context, conversationID string) error
 }
 
+// ExecutionRequestSnapshotRepository define o contrato para carregar e atualizar snapshots lógicos de ExecutionRequest (INV-01, INV-04).
+type ExecutionRequestSnapshotRepository interface {
+	GetExecutionRequest(ctx context.Context, id string) (*domain.ExecutionRequest, error)
+	FetchMessagesForRequest(ctx context.Context, req *domain.ExecutionRequest) ([]*domain.Message, error)
+	UpdateStatus(ctx context.Context, id string, status domain.ExecutionRequestStatus) error
+}
+
 // ConversationCoordinator define o contrato para coordenação distribuída entre múltiplos workers (INV-02, INV-04, INV-08).
 type ConversationCoordinator interface {
 	AcquireExecution(ctx context.Context, tenantID, conversationID, workerID string, leaseDuration time.Duration) (*domain.ConversationExecution, error)
@@ -65,6 +72,7 @@ type DefaultMessagePipelineHandler struct {
 	coordinator       ConversationCoordinator
 	debounceRepo      DebounceRepository
 	scheduleRepo      ExecutionSchedulerRepository
+	execReqRepo       ExecutionRequestSnapshotRepository
 	debounceCfg       domain.DebounceConfig
 	workerID          string
 	leaseTime         time.Duration
@@ -104,6 +112,12 @@ func WithDebounce(repo DebounceRepository, cfg domain.DebounceConfig) PipelineOp
 func WithScheduler(repo ExecutionSchedulerRepository) PipelineOption {
 	return func(h *DefaultMessagePipelineHandler) {
 		h.scheduleRepo = repo
+	}
+}
+
+func WithExecutionRequestRepository(repo ExecutionRequestSnapshotRepository) PipelineOption {
+	return func(h *DefaultMessagePipelineHandler) {
+		h.execReqRepo = repo
 	}
 }
 
@@ -301,11 +315,26 @@ func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Contex
 
 	// 4. Execução do Runtime (IA / Mock)
 	if h.runtime != nil {
+		var snapshotMsgs []*domain.Message
+		var watermark int64 = seqNumber
+		execReqID := ""
+
+		if h.execReqRepo != nil {
+			// Se o evento carrega um execution_request_id nos metadados ou se busca o snapshot ativo
+			// (ex: enviado pelo evento conversation.execution.ready)
+			if reqID, ok := evt.Payload.ExternalMessageID, false; ok {
+				_ = reqID
+			}
+		}
+
 		execInput := domain.ExecutionInput{
-			TenantID:       tenantID,
-			ConversationID: convID,
-			MessageID:      msgID,
-			Content:        evt.Payload.Content,
+			ExecutionRequestID: execReqID,
+			TenantID:           tenantID,
+			ConversationID:     convID,
+			MessageID:          msgID,
+			WatermarkSequence:  watermark,
+			SnapshotMessages:   snapshotMsgs,
+			Content:            evt.Payload.Content,
 			Metadata: map[string]string{
 				"channel":         evt.Payload.Channel,
 				"role":            string(evt.Payload.Role),

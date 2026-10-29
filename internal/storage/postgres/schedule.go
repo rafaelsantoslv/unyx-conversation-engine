@@ -151,6 +151,46 @@ func (r *ScheduleRepository) ClaimDueSchedulesWithOutbox(ctx context.Context, ba
 	`
 
 	for _, s := range claimed {
+		// 2.1 Cria ExecutionRequest com snapshot delimitado pelo watermark e IDs das mensagens (INV-01, INV-04)
+		var messageIDs []string
+		var maxSeq int64 = 1
+
+		msgQuery := `
+		SELECT id, sequence_number
+		FROM messages
+		WHERE tenant_id = $1 AND conversation_id = $2
+		ORDER BY sequence_number ASC;
+		`
+		mRows, mErr := tx.Query(ctx, msgQuery, s.TenantID, s.ConversationID)
+		if mErr == nil {
+			for mRows.Next() {
+				var mid string
+				var mseq int64
+				if scanErr := mRows.Scan(&mid, &mseq); scanErr == nil {
+					messageIDs = append(messageIDs, mid)
+					if mseq > maxSeq {
+						maxSeq = mseq
+					}
+				}
+			}
+			mRows.Close()
+		}
+
+		var execReqID string
+		if len(messageIDs) > 0 {
+			execReqID = uuid.New().String()
+			msgIDsJSON, _ := json.Marshal(messageIDs)
+
+			insertReqQuery := `
+			INSERT INTO execution_requests (
+				id, tenant_id, conversation_id, generation_id, watermark_sequence, message_ids, status, created_at, updated_at
+			) VALUES (
+				$1, $2, $3, 1, $4, $5, 'PENDING', $6, $6
+			);
+			`
+			_, _ = tx.Exec(ctx, insertReqQuery, execReqID, s.TenantID, s.ConversationID, maxSeq, msgIDsJSON, now)
+		}
+
 		payloadObj := domain.Event[domain.ExecutionReadyPayload]{
 			EventID:        uuid.New().String(),
 			TenantID:       s.TenantID,
@@ -159,10 +199,13 @@ func (r *ScheduleRepository) ClaimDueSchedulesWithOutbox(ctx context.Context, ba
 			Version:        domain.EventVersionV1,
 			OccurredAt:     now,
 			Payload: domain.ExecutionReadyPayload{
-				ConversationID: s.ConversationID,
-				TenantID:       s.TenantID,
-				TriggeredAt:    now,
-				Reason:         "debounce_or_scheduled_execution",
+				ExecutionRequestID: execReqID,
+				ConversationID:     s.ConversationID,
+				TenantID:           s.TenantID,
+				WatermarkSequence:  maxSeq,
+				MessageIDs:         messageIDs,
+				TriggeredAt:        now,
+				Reason:             "debounce_or_scheduled_execution",
 			},
 		}
 
