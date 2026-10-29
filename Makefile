@@ -23,6 +23,9 @@ test:
 test-e2e:
 	go test -v ./tests/e2e/...
 
+test-load:
+	docker run --rm -i --net=host -v $(shell pwd)/tests/load:/tests/load grafana/k6 run /tests/load/ingestion_stress.js
+
 test-resilience:
 	go test -v ./tests/e2e/... -run TestResilience_EPIC03_Matrix
 
