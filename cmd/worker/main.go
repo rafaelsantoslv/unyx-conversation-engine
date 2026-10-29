@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/config"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/runtime/mock"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/service"
 	transkafka "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/kafka"
 )
@@ -50,8 +51,12 @@ func main() {
 		}
 	}()
 
-	// 3. Inicializa Worker Service com handler de pipeline
-	pipelineHandler := &service.DefaultMessagePipelineHandler{}
+	// 3. Inicializa MockRuntime e Worker Service com handler de pipeline
+	mockRuntime := mock.NewMockRuntime(
+		mock.WithLatency(150 * time.Millisecond), // Simula tempo de raciocínio da IA
+		mock.WithSimulatedReply("Olá! Sou o assistente virtual Unyx. Como posso ajudar você hoje?"),
+	)
+	pipelineHandler := service.NewDefaultMessagePipelineHandler(mockRuntime)
 	workerService := service.NewConversationWorkerService(kafkaConsumer, pipelineHandler)
 
 	// 4. Servidor HTTP de Health Check e Liveness

@@ -17,12 +17,42 @@ type MessagePipelineHandler interface {
 	HandleMessageReceived(ctx context.Context, evt domain.Event[domain.MessageReceivedPayload]) error
 }
 
-// DefaultMessagePipelineHandler é uma implementação padrão para o worker encaminhar a mensagem.
-type DefaultMessagePipelineHandler struct{}
+// DefaultMessagePipelineHandler é uma implementação padrão para o worker encaminhar a mensagem para o AgentRuntime.
+type DefaultMessagePipelineHandler struct {
+	runtime domain.AgentRuntime
+}
+
+// NewDefaultMessagePipelineHandler cria um novo handler integrando o AgentRuntime.
+func NewDefaultMessagePipelineHandler(runtime domain.AgentRuntime) *DefaultMessagePipelineHandler {
+	return &DefaultMessagePipelineHandler{runtime: runtime}
+}
 
 func (h *DefaultMessagePipelineHandler) HandleMessageReceived(ctx context.Context, evt domain.Event[domain.MessageReceivedPayload]) error {
 	log.Printf("[pipeline] message event received: event_id=%s, tenant=%s, conv=%s, role=%s, content_len=%d",
 		evt.EventID, evt.TenantID, evt.ConversationID, evt.Payload.Role, len(evt.Payload.Content))
+
+	if h.runtime != nil {
+		execInput := domain.ExecutionInput{
+			TenantID:       evt.TenantID,
+			ConversationID: evt.ConversationID,
+			MessageID:      evt.Payload.MessageID,
+			Content:        evt.Payload.Content,
+			Metadata: map[string]string{
+				"channel":  evt.Payload.Channel,
+				"role":     string(evt.Payload.Role),
+				"event_id": evt.EventID,
+			},
+		}
+
+		out, err := h.runtime.Execute(ctx, execInput)
+		if err != nil {
+			return fmt.Errorf("agent runtime execution error: %w", err)
+		}
+
+		log.Printf("[pipeline] agent runtime responded successfully: tokens=%d, reply_preview=%.40s...",
+			out.TokensUsed, out.ResponseContent)
+	}
+
 	return nil
 }
 
