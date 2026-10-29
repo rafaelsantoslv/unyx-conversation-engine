@@ -31,6 +31,7 @@ type Conversation struct {
 	Channel                string                 `json:"channel"`
 	State                  ConversationState      `json:"state"`
 	Version                int64                  `json:"version"`
+	ResumedAtSequence      int64                  `json:"resumed_at_sequence"`
 	Metadata               map[string]interface{} `json:"metadata,omitempty"`
 	CreatedAt              time.Time              `json:"created_at"`
 	UpdatedAt              time.Time              `json:"updated_at"`

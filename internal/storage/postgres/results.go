@@ -75,12 +75,22 @@ func (r *ResultsRepository) GetResult(ctx context.Context, tenantID, conversatio
 
 // IsPrecedingSequenceCompleted verifica se a mensagem N-1 de uma conversa já foi concluída (SUCCEEDED).
 // Se targetSeq <= 1, retorna true imediatamente (primeira mensagem da conversa).
+// Se a mensagem N-1 foi enviada durante período humano (sequence_number <= resumed_at_sequence),
+// considera-se completada (bypassed/read) para permitir a execução da nova mensagem da IA (INV-04, INV-06).
 func (r *ResultsRepository) IsPrecedingSequenceCompleted(ctx context.Context, conversationID string, targetSeq int64) (bool, error) {
 	if targetSeq <= 1 {
 		return true, nil
 	}
 
 	precedingSeq := targetSeq - 1
+
+	// Checa se a sequência precedente faz parte do período coberto pela marca de retomada (resumed_at_sequence)
+	var resumedAtSeq int64
+	err := r.pool.QueryRow(ctx, "SELECT resumed_at_sequence FROM conversations WHERE id = $1", conversationID).Scan(&resumedAtSeq)
+	if err == nil && precedingSeq <= resumedAtSeq {
+		return true, nil
+	}
+
 	query := `
 	SELECT status
 	FROM processing_results
@@ -88,7 +98,7 @@ func (r *ResultsRepository) IsPrecedingSequenceCompleted(ctx context.Context, co
 	`
 
 	var statusStr string
-	err := r.pool.QueryRow(ctx, query, conversationID, precedingSeq).Scan(&statusStr)
+	err = r.pool.QueryRow(ctx, query, conversationID, precedingSeq).Scan(&statusStr)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil

@@ -38,7 +38,7 @@ func (r *Repository) GetOrCreateConversation(ctx context.Context, tenantID, exte
 	VALUES ($1, $2, $3, 'default', 'AI_ACTIVE', 1, '{}'::jsonb, $4, $4)
 	ON CONFLICT (tenant_id, external_id)
 	DO UPDATE SET updated_at = conversations.updated_at
-	RETURNING id, tenant_id, COALESCE(user_id, ''), external_id, channel, status, version, metadata, created_at, updated_at;
+	RETURNING id, tenant_id, COALESCE(user_id, ''), external_id, channel, status, version, resumed_at_sequence, metadata, created_at, updated_at;
 	`
 
 	var conv domain.Conversation
@@ -53,6 +53,7 @@ func (r *Repository) GetOrCreateConversation(ctx context.Context, tenantID, exte
 		&conv.Channel,
 		&statusStr,
 		&conv.Version,
+		&conv.ResumedAtSequence,
 		&metaBytes,
 		&conv.CreatedAt,
 		&conv.UpdatedAt,
@@ -363,7 +364,7 @@ func (r *Repository) TransitionConversationState(
 	var statusStr string
 	var metaBytes []byte
 	selectQuery := `
-	SELECT id, tenant_id, COALESCE(user_id, ''), external_id, channel, status, version, metadata, created_at, updated_at
+	SELECT id, tenant_id, COALESCE(user_id, ''), external_id, channel, status, version, resumed_at_sequence, metadata, created_at, updated_at
 	FROM conversations
 	WHERE tenant_id = $1 AND id = $2
 	FOR UPDATE;
@@ -376,6 +377,7 @@ func (r *Repository) TransitionConversationState(
 		&conv.Channel,
 		&statusStr,
 		&conv.Version,
+		&conv.ResumedAtSequence,
 		&metaBytes,
 		&conv.CreatedAt,
 		&conv.UpdatedAt,
@@ -412,13 +414,32 @@ func (r *Repository) TransitionConversationState(
 	now := time.Now().UTC()
 	nextVersion := conv.Version + 1
 
-	// 4. Atualiza o estado da conversa e incrementa versão
+	// Se estiver transicionando para HUMAN_ACTIVE ou CLOSED, cancela quaisquer agendamentos pendentes de execução
+	if toState == domain.StateHumanActive || toState == domain.StateClosed {
+		cancelScheduleQuery := `
+		UPDATE conversation_schedules
+		SET status = 'CANCELLED', updated_at = $1
+		WHERE tenant_id = $2 AND conversation_id = $3 AND status = 'PENDING';
+		`
+		_, _ = tx.Exec(ctx, cancelScheduleQuery, now, tenantID, conversationID)
+	}
+
+	// Se estiver retomando para AI_ACTIVE a partir de HUMAN_ACTIVE ou CLOSED (Fresh Start / Resumption Watermark):
+	// define resumed_at_sequence = MAX(sequence_number) para não disparar IA em mensagens passadas (INV-04, INV-06)
+	nextResumedSeq := conv.ResumedAtSequence
+	if toState == domain.StateAIActive && (fromState == domain.StateHumanActive || fromState == domain.StateClosed) {
+		var maxSeq int64
+		_ = tx.QueryRow(ctx, "SELECT COALESCE(MAX(sequence_number), 0) FROM messages WHERE tenant_id = $1 AND conversation_id = $2", tenantID, conversationID).Scan(&maxSeq)
+		nextResumedSeq = maxSeq
+	}
+
+	// 4. Atualiza o estado da conversa, resumed_at_sequence e incrementa versão
 	updateQuery := `
 	UPDATE conversations
-	SET status = $1, version = $2, updated_at = $3
-	WHERE tenant_id = $4 AND id = $5 AND version = $6;
+	SET status = $1, version = $2, resumed_at_sequence = $3, updated_at = $4
+	WHERE tenant_id = $5 AND id = $6 AND version = $7;
 	`
-	cmdTag, err := tx.Exec(ctx, updateQuery, string(toState), nextVersion, now, tenantID, conversationID, fromVersion)
+	cmdTag, err := tx.Exec(ctx, updateQuery, string(toState), nextVersion, nextResumedSeq, now, tenantID, conversationID, fromVersion)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update conversation state: %w", err)
 	}
@@ -428,6 +449,7 @@ func (r *Repository) TransitionConversationState(
 
 	conv.State = toState
 	conv.Version = nextVersion
+	conv.ResumedAtSequence = nextResumedSeq
 	conv.UpdatedAt = now
 	if len(metaBytes) > 0 {
 		_ = json.Unmarshal(metaBytes, &conv.Metadata)

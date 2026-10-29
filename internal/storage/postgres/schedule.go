@@ -151,17 +151,27 @@ func (r *ScheduleRepository) ClaimDueSchedulesWithOutbox(ctx context.Context, ba
 	`
 
 	for _, s := range claimed {
-		// 2.1 Cria ExecutionRequest com snapshot delimitado pelo watermark e IDs das mensagens (INV-01, INV-04)
+		// 2.1 Verifica o estado atual e a marca de retomada (resumed_at_sequence) da conversa (INV-04, INV-06)
+		var convState string
+		var resumedAtSeq int64
+		_ = tx.QueryRow(ctx, "SELECT status, resumed_at_sequence FROM conversations WHERE tenant_id = $1 AND id = $2", s.TenantID, s.ConversationID).Scan(&convState, &resumedAtSeq)
+
+		// Se a conversa não está em AI_ACTIVE, não emite nem cria ExecutionRequest (INV-06)
+		if convState != string(domain.StateAIActive) {
+			continue
+		}
+
+		// 2.2 Cria ExecutionRequest com snapshot delimitado pelo watermark e IDs das mensagens após resumedAtSeq (INV-01, INV-04)
 		var messageIDs []string
-		var maxSeq int64 = 1
+		var maxSeq int64 = resumedAtSeq
 
 		msgQuery := `
 		SELECT id, sequence_number
 		FROM messages
-		WHERE tenant_id = $1 AND conversation_id = $2
+		WHERE tenant_id = $1 AND conversation_id = $2 AND sequence_number > $3
 		ORDER BY sequence_number ASC;
 		`
-		mRows, mErr := tx.Query(ctx, msgQuery, s.TenantID, s.ConversationID)
+		mRows, mErr := tx.Query(ctx, msgQuery, s.TenantID, s.ConversationID, resumedAtSeq)
 		if mErr == nil {
 			for mRows.Next() {
 				var mid string
@@ -176,6 +186,7 @@ func (r *ScheduleRepository) ClaimDueSchedulesWithOutbox(ctx context.Context, ba
 			mRows.Close()
 		}
 
+		// Se não há mensagens gravadas ainda, mas o agendamento foi disparado, define maxSeq padrão 0
 		var execReqID string
 		if len(messageIDs) > 0 {
 			execReqID = uuid.New().String()
