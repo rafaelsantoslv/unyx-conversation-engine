@@ -48,7 +48,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start)                                                                      
 		reqID := RequestIDFromContext(r.Context())                                                         
 																									
-		slog.Info("http request completed",                                                                
+		slog.InfoContext(r.Context(), "http request completed",                                                                
 			"request_id", reqID,                                                                               
 			"method", r.Method,                                                                                
 			"path", r.URL.Path,                                                                                

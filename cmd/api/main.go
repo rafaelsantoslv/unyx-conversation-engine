@@ -15,11 +15,14 @@ import (
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/config"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/service"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/storage/postgres"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/telemetry"
 	transporthttp "github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/http"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/http/handler"
 )
 
 func main() {
+	telemetry.SetGlobalLogger(telemetry.NewJSONLogger(os.Stdout, 0))
+
 	cfg, err := config.Load(8080)
 	if err != nil {
 		log.Fatalf("failed to load configuration: %v", err)

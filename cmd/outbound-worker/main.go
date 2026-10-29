@@ -16,10 +16,13 @@ import (
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/integration/chatwoot"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/outbound"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/storage/postgres"
+	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/telemetry"
 	"github.com/rafaelsantoslv/unyx-conversation-engine/internal/transport/http/handler"
 )
 
 func main() {
+	telemetry.SetGlobalLogger(telemetry.NewJSONLogger(os.Stdout, 0))
+
 	cfg, err := config.Load(8083)
 	if err != nil {
 		log.Fatalf("failed to load configuration: %v", err)
